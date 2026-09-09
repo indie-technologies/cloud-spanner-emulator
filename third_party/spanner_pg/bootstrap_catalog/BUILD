@@ -117,9 +117,13 @@ cc_test(
 
 filegroup(
     name = "spanner_pg_datfiles",
-    srcs = glob([
-        "spanner_pg_data/pg_*.dat",
-    ]),
+    srcs = glob(
+        ["spanner_pg_data/pg_*.dat"],
+        exclude = [
+            "spanner_pg_data/pg_aggregate.dat",
+            "spanner_pg_data/pg_proc.dat",
+        ],
+    ),
 )
 
 cc_library(
@@ -169,14 +173,16 @@ genrule(
         set -e # Exit on error
 
         INCLUDE_PATH=third_party/spanner_pg/src/include
-        ENGINE_CATALOG_PATH=third_party/spanner_pg/bootstrap_catalog/spanner_pg_data
+        ENGINE_CATALOG_PATH=$$(mktemp -d "$(@D)/engine_catalog.XXXXXX")
+        trap 'rm -rf "$$ENGINE_CATALOG_PATH"' EXIT
 
-        # Copies generated files into the engine catalog path
-        cp $(location //third_party/spanner_pg/codegen:pg_aggregate.dat) $$ENGINE_CATALOG_PATH
-        cp $(location //third_party/spanner_pg/codegen:pg_proc.dat) $$ENGINE_CATALOG_PATH
+        # Keep generated inputs out of the source tree and separate across builds.
+        cp $(locations :spanner_pg_datfiles) "$$ENGINE_CATALOG_PATH"
+        cp $(location //third_party/spanner_pg/codegen:pg_aggregate.dat) "$$ENGINE_CATALOG_PATH"
+        cp $(location //third_party/spanner_pg/codegen:pg_proc.dat) "$$ENGINE_CATALOG_PATH"
 
         $(location gen_catalog_info.pl) \
-            -output /tmp \
+            -output "$(@D)" \
             --include-path=$$INCLUDE_PATH \
             --engine-catalog-path=$$ENGINE_CATALOG_PATH \
             third_party/spanner_pg/src/include/catalog/pg_proc.h \
@@ -242,10 +248,6 @@ genrule(
             third_party/spanner_pg/src/include/catalog/pg_publication_rel.h \
             third_party/spanner_pg/src/include/catalog/pg_subscription.h \
             third_party/spanner_pg/src/include/catalog/pg_subscription_rel.h
-
-        mv /tmp/bootstrap_catalog_info.h $(location bootstrap_catalog_info.h)
-        mv /tmp/bootstrap_catalog_info.c $(location bootstrap_catalog_info.c)
-        mv /tmp/bootstrap_catalog_textproto.h $(location bootstrap_catalog_textproto.h)
     """,
     tools = ["gen_catalog_info.pl"],
 )
