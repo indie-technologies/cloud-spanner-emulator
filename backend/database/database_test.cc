@@ -170,6 +170,81 @@ TEST_F(DatabaseTest, UpdateSchemaSuccessful) {
   GOOGLESQL_EXPECT_OK(backfill_status);
 }
 
+TEST_F(DatabaseTest, SchemaSnapshotSurvivesReplacement) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto db, Database::Create(&clock_, kDatabaseId, SchemaChangeOperation{}));
+  auto snapshot = db->GetLatestSchema();
+  std::weak_ptr<const Schema> previous = snapshot;
+  absl::Status backfill_status;
+  int completed_statements;
+  absl::Time commit_ts;
+  GOOGLESQL_ASSERT_OK(db->UpdateSchema(
+      {.statements = {"CREATE TABLE T (k1 INT64) PRIMARY KEY (k1)"}},
+      &completed_statements, &commit_ts, &backfill_status));
+  GOOGLESQL_ASSERT_OK(backfill_status);
+  EXPECT_EQ(snapshot->FindTable("T"), nullptr);
+  EXPECT_NE(db->GetLatestSchema()->FindTable("T"), nullptr);
+  snapshot.reset();
+  EXPECT_TRUE(previous.expired());
+}
+
+TEST_F(DatabaseTest, AbortedReaderKeepsItsSchemaMetadataAlive) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto db, Database::Create(
+                   &clock_, kDatabaseId,
+                   {.statements = {
+                        "CREATE TABLE T (k1 INT64) PRIMARY KEY (k1)"}}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto reader,
+                                db->CreateReadOnlyTransaction(ReadOnlyOptions{}));
+  std::weak_ptr<const Schema> previous = db->GetLatestSchema();
+  absl::Status backfill_status;
+  int completed_statements;
+  absl::Time commit_ts;
+  GOOGLESQL_ASSERT_OK(db->UpdateSchema(
+      {.statements = {"DROP TABLE T"}}, &completed_statements, &commit_ts,
+      &backfill_status));
+  GOOGLESQL_ASSERT_OK(backfill_status);
+  EXPECT_THAT(reader->status(), StatusIs(absl::StatusCode::kAborted));
+  EXPECT_FALSE(previous.expired());
+  EXPECT_NE(reader->schema()->FindTable("T"), nullptr);
+  EXPECT_EQ(db->GetLatestSchema()->FindTable("T"), nullptr);
+  reader.reset();
+  EXPECT_TRUE(previous.expired());
+}
+
+TEST_F(DatabaseTest, FirstWriteAfterSchemaChangeUsesNewValidators) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto db, Database::Create(
+                   &clock_, kDatabaseId,
+                   {.statements = {
+                        "CREATE TABLE T (k1 INT64, k2 INT64) PRIMARY KEY (k1)"}}));
+  Mutation valid;
+  valid.AddWriteOp(MutationOpType::kInsert, "T", {"k1", "k2"},
+                   {{Int64(1), Int64(2)}});
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto writer, db->CreateReadWriteTransaction(ReadWriteOptions{}, RetryState{}));
+  GOOGLESQL_ASSERT_OK(writer->Write(valid));
+  GOOGLESQL_ASSERT_OK(writer->Commit());
+  writer.reset();
+
+  absl::Status backfill_status;
+  int completed_statements;
+  absl::Time commit_ts;
+  GOOGLESQL_ASSERT_OK(db->UpdateSchema(
+      {.statements = {"ALTER TABLE T ADD CONSTRAINT positive CHECK (k2 > 0)"}},
+      &completed_statements, &commit_ts, &backfill_status));
+  GOOGLESQL_ASSERT_OK(backfill_status);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      writer, db->CreateReadWriteTransaction(ReadWriteOptions{}, RetryState{}));
+  std::unique_ptr<RowCursor> cursor;
+  GOOGLESQL_ASSERT_OK(writer->Read(read_column("T", "k1"), &cursor));
+  Mutation invalid;
+  invalid.AddWriteOp(MutationOpType::kInsert, "T", {"k1", "k2"},
+                     {{Int64(2), Int64(-1)}});
+  EXPECT_THAT(writer->Write(invalid),
+              StatusIs(absl::StatusCode::kOutOfRange));
+}
+
 TEST_F(DatabaseTest, UpdateSchemaPartialSuccess) {
   std::vector<std::string> create_statements = {R"(
     CREATE TABLE T(

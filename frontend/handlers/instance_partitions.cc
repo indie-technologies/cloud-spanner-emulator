@@ -61,7 +61,7 @@ GetReferencingDatabases(ServerEnv* env, const std::string& instance_uri) {
     if (db->backend() == nullptr) {
       continue;
     }
-    const auto* schema = db->backend()->GetLatestSchema();
+    auto schema = db->backend()->GetLatestSchema();
     if (schema == nullptr) {
       continue;
     }

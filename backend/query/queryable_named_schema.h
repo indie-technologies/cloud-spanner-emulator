@@ -17,6 +17,7 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_QUERY_QUERYABLE_NAMED_SCHEMA_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_QUERY_QUERYABLE_NAMED_SCHEMA_H_
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -43,8 +44,12 @@ namespace backend {
 // backend NamedSchema.
 class QueryableNamedSchema : public googlesql::EnumerableCatalog {
  public:
+  using TableLookup =
+      std::function<const QueryableTable*(const std::string&)>;
+
   explicit QueryableNamedSchema(
-      const backend::NamedSchema* backend_named_schema);
+      const backend::NamedSchema* backend_named_schema,
+      TableLookup table_lookup = {});
 
   const backend::NamedSchema* wrapped_named_schema() const {
     return wrapped_named_schema_;
@@ -100,6 +105,8 @@ class QueryableNamedSchema : public googlesql::EnumerableCatalog {
                            const FindOptions& options) final;
 
  private:
+  // The root catalog owns lazy wrappers; this callback resolves qualified names.
+  TableLookup table_lookup_;
   CaseInsensitiveStringMap<std::unique_ptr<const QueryableTable>> tables_;
   CaseInsensitiveStringMap<std::unique_ptr<const QueryableSequence>> sequences_;
   CaseInsensitiveStringMap<std::unique_ptr<const QueryableView>> views_;

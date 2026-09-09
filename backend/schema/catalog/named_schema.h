@@ -52,6 +52,7 @@ class NamedSchema : public SchemaNode {
   const NamedSchemaID id() const { return id_; }
 
   absl::Span<const Table* const> tables() const { return tables_; }
+  absl::Span<const Table* const> synonyms() const { return synonyms_; }
   absl::Span<const View* const> views() const { return views_; }
   absl::Span<const Index* const> indexes() const { return indexes_; }
   absl::Span<const Sequence* const> sequences() const { return sequences_; }

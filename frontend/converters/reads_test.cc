@@ -78,6 +78,29 @@ using googlesql::values::String;
 using googlesql::values::Uuid;
 using googlesql_base::testing::StatusIs;
 
+TEST(ReadOnlyOptionsTest, AcceptsOnlyStrongReads) {
+  using ReadOnly = google::spanner::v1::TransactionOptions::ReadOnly;
+  ReadOnly options;
+  GOOGLESQL_EXPECT_OK(ReadOnlyOptionsFromProto(options));
+  options.set_strong(true);
+  GOOGLESQL_EXPECT_OK(ReadOnlyOptionsFromProto(options));
+  options.set_strong(false);
+  EXPECT_THAT(ReadOnlyOptionsFromProto(options),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  options.mutable_read_timestamp()->set_seconds(1);
+  EXPECT_THAT(ReadOnlyOptionsFromProto(options),
+              StatusIs(absl::StatusCode::kUnimplemented));
+  options.mutable_exact_staleness()->set_seconds(1);
+  EXPECT_THAT(ReadOnlyOptionsFromProto(options),
+              StatusIs(absl::StatusCode::kUnimplemented));
+  options.mutable_max_staleness()->set_seconds(1);
+  EXPECT_THAT(ReadOnlyOptionsFromProto(options),
+              StatusIs(absl::StatusCode::kUnimplemented));
+  options.mutable_min_read_timestamp()->set_seconds(1);
+  EXPECT_THAT(ReadOnlyOptionsFromProto(options),
+              StatusIs(absl::StatusCode::kUnimplemented));
+}
+
 class AccessProtosTest : public testing::Test {
  public:
   AccessProtosTest()

@@ -65,8 +65,10 @@ absl::Status BeginTransaction(
     backend::Mutation mutation;
     google::protobuf::RepeatedPtrField<spanner_api::Mutation> mutations;
     *mutations.Add() = request->mutation_key();
-    absl::Status status =
-        MutationFromProto(*txn->schema(), mutations, &mutation);
+    absl::Status status = txn->GuardedCall(
+        Transaction::OpType::kRead, [&]() -> absl::Status {
+          return MutationFromProto(*txn->schema(), mutations, &mutation);
+        });
     // MutationFromProto returns FailedPrecondition if the proto does not
     // contain a syntactically valid proto. Spanner however returns
     // InvalidArgument in the same scenario, so we convert that here to

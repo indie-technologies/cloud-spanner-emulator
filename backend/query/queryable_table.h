@@ -42,11 +42,11 @@ namespace backend {
 // the table through a RowReader.
 class QueryableTable : public googlesql::Table {
  public:
-  // 'options' , 'catalog' , 'type_factory' must be non-null when specifying a
-  // QueryableTable with default value columns.
+  // 'options', 'catalog', and 'type_factory' must be non-null for default or
+  // generated column expressions. Options are borrowed during construction.
   QueryableTable(
       const backend::Table* table, RowReader* reader,
-      std::optional<const googlesql::AnalyzerOptions> options = std::nullopt,
+      const googlesql::AnalyzerOptions* options = nullptr,
       googlesql::Catalog* catalog = nullptr,
       googlesql::TypeFactory* type_factory = nullptr, bool is_synonym = false);
 
@@ -84,7 +84,7 @@ class QueryableTable : public googlesql::Table {
   AnalyzeColumnExpression(
       const Column* column, googlesql::TypeFactory* type_factory,
       googlesql::Catalog* catalog,
-      std::optional<const googlesql::AnalyzerOptions> opt_options) const;
+      const googlesql::AnalyzerOptions* options) const;
 
   // Whether the table should be treated as a synonym.
   bool is_synonym_;

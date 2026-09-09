@@ -110,7 +110,7 @@ class LockHandle {
   friend std::unique_ptr<LockHandle>::deleter_type;
   LockHandle(LockManager* manager, TransactionID tid,
              const std::function<absl::Status()>& abort_fn,
-             TransactionPriority priority);
+             TransactionPriority priority, bool abort_on_contention);
   ~LockHandle();
 
   // Aborts the requests made by this handle (and puts it in a final state).
@@ -138,6 +138,10 @@ class LockHandle {
 
   // The priority of the transaction which owns this lock handle.
   TransactionPriority priority_;
+
+  // Idle read-only transactions have no commit/rollback RPC. Allow another
+  // transaction to reclaim their lock without relying on random aborts.
+  const bool abort_on_contention_;
 
   // Mutex to guard state below.
   absl::Mutex mu_;

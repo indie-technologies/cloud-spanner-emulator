@@ -287,7 +287,7 @@ absl::Status GetDatabaseDdl(RequestContext* ctx,
 
   auto latest_schema = database->backend()->GetLatestSchema();
   GOOGLESQL_ASSIGN_OR_RETURN(std::vector<std::string> printed_statements,
-                   backend::PrintDDLStatements(latest_schema));
+                   backend::PrintDDLStatements(latest_schema.get()));
   for (const auto& statement : printed_statements) {
     response->add_statements(statement);
   }

@@ -42,6 +42,10 @@ class SchemaObjectsPool {
     schema_node_pool_.insert(std::move(node));
   }
 
+  // Tests ownership without scanning the nodes or transferring ownership.
+  bool Contains(const SchemaNode* node) const {
+    return schema_node_pool_.contains(node);
+  }
 
   // Removes deleted nodes from the pool. Returns the number of removed nodes.
   int Trim() {

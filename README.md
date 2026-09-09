@@ -10,6 +10,38 @@ production database or to provide similar performance to Cloud Spanner. The
 emulator is specifically intended for local unit testing of applications
 targeting Cloud Spanner.
 
+## Transaction and storage behavior in this fork
+
+This fork uses single-version row storage and permits one active database
+transaction at a time, including read-only transactions and schema changes.
+Only strong reads are supported; explicit historical timestamps and staleness
+bounds are rejected. These changes apply to binaries built from this source,
+not the upstream prebuilt images linked below.
+
+An idle reusable read-only transaction is aborted when another transaction needs
+the database. Reusing its ID returns `ABORTED`; callers must start a new
+transaction and retry the entire read operation. A query or result stream in
+progress cannot be preempted. Single-use reads release ownership when their
+request finishes; session cleanup also releases ownership. Change streams use
+short strong reads between waits and retain their history as ordinary rows.
+Read-write transactions retain their existing write buffers, commit timestamps,
+and rollback behavior.
+
+Rows store only their current values, and deleting a row removes it from storage.
+Storage timestamps no longer select historical data. The schema catalog retains
+only the current schema and snapshots still referenced by a transaction or admin
+request. Write validators are built on the first write after a schema change.
+Migrations still copy schema graphs for validation and backfills, and delayed
+cleanup of dropped schema objects remains. Streaming SQL reuses its analysis for
+change-stream detection, and ordinary DML is analyzed without column pruning
+from the start to avoid a second analysis. See the
+[storage benchmark results](backend/storage/README.md) and
+[schema migration benchmark notes](backend/schema/graph/README.md), plus the
+[migration and SQL benchmarks](frontend/handlers/PERFORMANCE.md).
+
+See the [overall performance impact](PERFORMANCE.md) for a direct comparison of
+all changes against the original emulator, including 1,024-step migrations.
+
 ## Quickstart
 
 There are multiple ways to invoke the emulator.
@@ -151,7 +183,7 @@ Notable supported features:
 
 - Instance and Database admin APIs including long running operations
 
-- Reads with stale timestamps
+- Strong reads (stale reads are disabled in this fork)
 
 - Secondary indexes
 

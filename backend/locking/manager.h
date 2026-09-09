@@ -52,7 +52,7 @@ class LockManager {
   // happens via the handle. See LockHandle methods for more details.
   std::unique_ptr<LockHandle> CreateHandle(
       TransactionID id, const std::function<absl::Status()>& abort_fn,
-      TransactionPriority priority);
+      TransactionPriority priority, bool abort_on_contention = false);
 
   // Returns the timestamp at which last schema update or commit completed.
   absl::Time LastCommitTimestamp();

@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
@@ -67,5 +68,42 @@ cc_library(
         "@com_google_googlesql//googlesql/base",
         "@com_google_googlesql//googlesql/base:ret_check",
         "@com_google_googlesql//googlesql/base:status",
+    ],
+)
+
+cc_library(
+    name = "schema_graph_editor_test_node",
+    testonly = True,
+    hdrs = ["schema_graph_editor_test_node.h"],
+    deps = [
+        ":schema_graph_editor",
+        ":schema_node",
+        "@com_google_absl//absl/status",
+    ],
+)
+
+cc_test(
+    name = "schema_graph_editor_test",
+    srcs = ["schema_graph_editor_test.cc"],
+    deps = [
+        ":schema_graph",
+        ":schema_graph_editor",
+        ":schema_graph_editor_test_node",
+        "//backend/schema/updater:schema_validation_context",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_binary(
+    name = "schema_graph_editor_benchmark",
+    testonly = True,
+    srcs = ["schema_graph_editor_benchmark.cc"],
+    deps = [
+        ":schema_graph",
+        ":schema_graph_editor",
+        ":schema_graph_editor_test_node",
+        "//backend/schema/updater:schema_validation_context",
+        "@com_github_google_benchmark//:benchmark",
     ],
 )

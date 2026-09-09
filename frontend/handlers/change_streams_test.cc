@@ -17,6 +17,7 @@
 #include "tests/common/change_streams.h"
 
 #include <algorithm>
+#include <functional>
 #include <optional>
 #include <string>
 #include <thread>  // NOLINT
@@ -43,6 +44,7 @@
 #include "backend/database/change_stream/change_stream_partition_churner.h"
 #include "backend/schema/updater/schema_updater.h"
 #include "common/clock.h"
+#include "common/errors.h"
 #include "frontend/converters/change_streams.h"
 #include "frontend/converters/pg_change_streams.h"
 #include "frontend/handlers/change_streams.h"
@@ -100,6 +102,23 @@ class ChangeStreamQueryAPITest
   std::string transaction_selector_err_msg_;
   absl::Time now_;
   std::string now_str_;
+  // The single-transaction emulator may abort a request when it overlaps DDL,
+  // a commit, or the partition churner. Retry the whole operation as a client
+  // would, with a bound so a regression cannot hang the test.
+  absl::Status RetryOnAbort(const std::function<absl::Status()>& operation,
+                           bool retry_ddl_conflict = false) {
+    const auto deadline = absl::Now() + absl::Seconds(15);
+    while (true) {
+      auto status = operation();
+      const bool retryable =
+          absl::IsAborted(status) ||
+          (retry_ddl_conflict &&
+           status == error::ConcurrentSchemaChangeOrReadWriteTxnInProgress());
+      if (!retryable || absl::Now() >= deadline) return status;
+      absl::SleepFor(absl::Milliseconds(1));
+    }
+  }
+
   absl::StatusOr<test::ChangeStreamRecords> ExecuteChangeStreamQuery(
       const std::string& sql, const std::string& transaction_selector = "{}") {
     spanner_api::ExecuteSqlRequest request = PARSE_TEXT_PROTO(absl::Substitute(
@@ -110,7 +129,10 @@ class ChangeStreamQueryAPITest
     request.set_session(test_session_uri_);
 
     std::vector<spanner_api::PartialResultSet> response;
-    GOOGLESQL_RETURN_IF_ERROR(ExecuteStreamingSql(request, &response));
+    GOOGLESQL_RETURN_IF_ERROR(RetryOnAbort([&] {
+      response.clear();
+      return ExecuteStreamingSql(request, &response);
+    }));
     for (int i = 0; i < response.size(); ++i) {
       GOOGLESQL_RET_CHECK(i == 0 ? response[i].has_metadata()
                        : !response[i].has_metadata());
@@ -125,7 +147,9 @@ class ChangeStreamQueryAPITest
 
   absl::Status UpdateSchema(std::vector<std::string> statements) {
     database_api::UpdateDatabaseDdlMetadata metadata;
-    return UpdateDatabaseDdl(test_database_uri_, statements, &metadata);
+    return RetryOnAbort(
+        [&] { return UpdateDatabaseDdl(test_database_uri_, statements, &metadata); },
+        /*retry_ddl_conflict=*/true);
   }
 
   std::string ConstructChangeStreamQuery(
@@ -199,7 +223,7 @@ class ChangeStreamQueryAPITest
     *commit_request.mutable_session() = test_session_uri_;
 
     spanner_api::CommitResponse commit_response;
-    return Commit(commit_request, &commit_response);
+    return RetryOnAbort([&] { return Commit(commit_request, &commit_response); });
   }
 
   absl::Status PopulateTestDatabase() {
@@ -359,9 +383,8 @@ TEST_P(ChangeStreamQueryAPITest,
        CannotReadUsingSingleUseReadOnlyNonStrongTransaction) {
   EXPECT_THAT(ExecuteChangeStreamQuery(
                   ConstructChangeStreamQuery(now_),
-                  "{ begin { read_only { exact_staleness { seconds: 1 } } } }"),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       testing::HasSubstr(transaction_selector_err_msg_)));
+                  "{ single_use { read_only { exact_staleness { seconds: 1 } } } }"),
+              StatusIs(absl::StatusCode::kUnimplemented));
 }
 
 TEST_P(ChangeStreamQueryAPITest, RejectsPlanMode) {
@@ -411,10 +434,9 @@ TEST_P(ChangeStreamQueryAPITest, RejectsRequestWithInvalidQueryIfNonStreaming) {
 }
 
 TEST_P(ChangeStreamQueryAPITest, ExecuteQueryOnJustDroppedChangeStream) {
-  std::thread drop_change_stream(&ChangeStreamQueryAPITest::UpdateSchema, this,
-                                 std::vector<std::string>{R"(
-     DROP CHANGE STREAM change_stream_test_table
-  )"});
+  std::thread drop_change_stream([&] {
+    GOOGLESQL_EXPECT_OK(UpdateSchema({"DROP CHANGE STREAM change_stream_test_table"}));
+  });
   // Occasionally due to latency in unit test it is possible that drop thread
   // finishes before ExecuteStreamingSql handler finishes validating query. To
   // avoid waiting too long in unit test, we just test the error status is
@@ -609,18 +631,24 @@ TEST_P(ChangeStreamQueryAPITest, VerifyChildPartitionsRecordContent) {
 }
 
 TEST_P(ChangeStreamQueryAPITest, VerifyHeartbeatRecordContent) {
-  absl::Time query_start = Clock().Now();
-  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto initial_active_token,
-                       GetActiveTokenFromInitialQuery(query_start));
+  // A real token can expire while an aborted request is retried, in which case
+  // the successful retry correctly returns only the child-partition record.
+  // Give this content test a fixed one-second token lifetime and prevent the
+  // background churner from contending with the heartbeat read.
+  absl::SetFlag(&FLAGS_change_stream_churning_interval, absl::Seconds(20));
+  absl::SetFlag(&FLAGS_change_stream_churn_thread_sleep_interval,
+                absl::Seconds(20));
+  now_ = Clock().Now();
+  GOOGLESQL_ASSERT_OK(PopulatePartitionTable());
+  absl::SetFlag(&FLAGS_cloud_spanner_emulator_test_with_fake_partition_table,
+                true);
+  const absl::Time query_start = now_;
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       test::ChangeStreamRecords change_records,
       ExecuteChangeStreamQuery(ConstructChangeStreamQuery(
-          query_start, std::nullopt, initial_active_token, 100)));
+          query_start, std::nullopt, "initial_token1", 100)));
   ASSERT_EQ(change_records.child_partition_records.size(), 1);
-  // actual number of heartbeat records may vary due to latencies and lagging
-  // churning thread, so for a test token with lifetime in [500ms, 1000ms], we
-  // check there are at least 1 heartbeat record returned when heartbeat
-  // milliseconds is 100ms.
+  // Scheduling can affect the count; verify the content of every heartbeat.
   ASSERT_GE(change_records.heartbeat_records.size(), 1);
   ASSERT_EQ(change_records.data_change_records.size(), 0);
   std::string last_record_time = test::EncodeTimestampString(
@@ -822,8 +850,9 @@ TEST_P(ChangeStreamQueryAPITest, ExecuteRealTimePartitionQueryThreaded) {
                 absl::Hours(1));
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto initial_active_token,
                        GetActiveTokenFromInitialQuery(now_));
-  std::thread insert_data_record(&ChangeStreamQueryAPITest::InsertOneRow, this,
-                                 "test_table");
+  std::thread insert_data_record([&] {
+    GOOGLESQL_EXPECT_OK(InsertOneRow("test_table"));
+  });
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       test::ChangeStreamRecords change_records,
       ExecuteChangeStreamQuery(ConstructChangeStreamQuery(

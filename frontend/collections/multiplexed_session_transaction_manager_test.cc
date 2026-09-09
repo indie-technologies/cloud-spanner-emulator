@@ -64,7 +64,7 @@ class MultiplexedSessionTransactionManagerTest : public testing::Test {
         std::move(GetSchema()).value());
     action_manager_ = std::make_unique<backend::ActionManager>();
     action_manager_->AddActionsForSchema(
-        versioned_catalog_->GetSchema(absl::InfiniteFuture()),
+        versioned_catalog_->GetLatestSchema(),
         /*function_catalog=*/nullptr, type_factory_.get());
   }
 
@@ -143,7 +143,7 @@ TEST_F(MultiplexedSessionTransactionManagerTest, ClearStaleTransactions) {
   spanner_api::TransactionOptions options;
   options.mutable_read_write();
   std::shared_ptr<Transaction> txn_to_add = std::make_shared<Transaction>(
-      std::move(backend_txn), nullptr, spanner_api::TransactionOptions(),
+      std::move(backend_txn), nullptr, options,
       Transaction::Usage::kMultiUse);
   GOOGLESQL_ASSERT_OK(
       mux_txn_manager.AddToCurrentTransactions(txn_to_add, kDatabaseUri, 1));
@@ -167,7 +167,7 @@ TEST_F(MultiplexedSessionTransactionManagerTest, ClearClosedTransactions) {
   spanner_api::TransactionOptions options;
   options.mutable_read_write();
   std::shared_ptr<Transaction> txn_to_add = std::make_shared<Transaction>(
-      std::move(backend_txn), nullptr, spanner_api::TransactionOptions(),
+      std::move(backend_txn), nullptr, options,
       Transaction::Usage::kMultiUse);
   GOOGLESQL_ASSERT_OK(
       mux_txn_manager.AddToCurrentTransactions(txn_to_add, kDatabaseUri, 1));

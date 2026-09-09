@@ -61,56 +61,38 @@ absl::StatusOr<absl::Duration> ParseVersionRetentionPeriod(
 
 }  // namespace
 
-VersionedCatalog::VersionedCatalog() {
-  schemas_[absl::InfinitePast()] = std::make_unique<const Schema>();
-}
+VersionedCatalog::VersionedCatalog()
+    : latest_schema_(std::make_shared<const Schema>()) {}
 
-VersionedCatalog::VersionedCatalog(
-    std::unique_ptr<const Schema> initial_schema) {
-  schemas_[absl::InfinitePast()] = std::move(initial_schema);
-}
-
-const Schema* VersionedCatalog::GetSchema(absl::Time timestamp) const {
-  absl::MutexLock lock(mu_);
-  auto itr = schemas_.upper_bound(timestamp);
-  itr--;
-  return itr->second.get();
-}
+VersionedCatalog::VersionedCatalog(std::unique_ptr<const Schema> initial_schema)
+    : latest_schema_(std::move(initial_schema)) {}
 
 const Schema* VersionedCatalog::GetLatestSchema() const {
-  return GetSchema(absl::InfiniteFuture());
+  absl::MutexLock lock(mu_);
+  return latest_schema_.get();
+}
+
+std::shared_ptr<const Schema> VersionedCatalog::GetLatestSchemaSnapshot() const {
+  absl::MutexLock lock(mu_);
+  return latest_schema_;
 }
 
 absl::Status VersionedCatalog::AddSchema(absl::Time creation_time,
                                          std::unique_ptr<const Schema> schema) {
   absl::MutexLock lock(mu_);
-  GOOGLESQL_RET_CHECK(creation_time > schemas_.rbegin()->first)
+  GOOGLESQL_RET_CHECK(creation_time > creation_time_)
       << "Failed to insert schema at " << absl::FormatTime(creation_time)
       << ": the latest schema creation timestamp is "
-      << absl::FormatTime(schemas_.rbegin()->first);
+      << absl::FormatTime(creation_time_);
   auto version_retention_period =
       ParseVersionRetentionPeriod(schema->version_retention_period());
   if (!version_retention_period.ok()) {
     return version_retention_period.status();
   }
   version_retention_period_ = *version_retention_period;
-  schemas_[creation_time] = std::move(schema);
+  latest_schema_ = std::move(schema);
+  creation_time_ = creation_time;
   return absl::OkStatus();
-}
-
-void VersionedCatalog::RemoveExpiredSchemas(absl::Time timestamp) {
-  absl::MutexLock lock(mu_);
-  auto upper_bound =
-      schemas_.upper_bound(timestamp - version_retention_period_);
-  auto it = ++schemas_.begin();  // Skip the infinite past schema.
-  while (it != upper_bound) {
-    auto next = it;
-    if (++next == upper_bound) {
-      // The current schema needs to be kept to cover the retention period.
-      break;
-    }
-    it = schemas_.erase(it);
-  }
 }
 
 }  // namespace backend

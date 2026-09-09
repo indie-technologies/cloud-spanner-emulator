@@ -141,7 +141,9 @@ class Transaction {
   // Calls ExecuteSql using the backend transaction and query engine with the
   // given query mode.
   absl::StatusOr<backend::QueryResult> ExecuteSql(
-      const backend::Query& query, v1::ExecuteSqlRequest_QueryMode query_mode);
+      const backend::Query& query, v1::ExecuteSqlRequest_QueryMode query_mode,
+      backend::ChangeStreamQueryValidator::ChangeStreamMetadata*
+          change_stream_metadata = nullptr);
 
   // Calls Write using the backend transaction.
   absl::Status Write(const backend::Mutation& mutation);
@@ -173,7 +175,7 @@ class Transaction {
   bool IsInvalid() const;
 
   // Returns true if the current transaction has been aborted.
-  // For ReadOnlyTransaction & PartitionedDmlTransaction, always returns false.
+  // Idle read-only transactions can also be aborted by a competing transaction.
   bool IsAborted() const;
 
   // Returns true if the current transaction is a ReadOnlyTransaction.
@@ -205,6 +207,9 @@ class Transaction {
 
   // Returns the current transaction status.
   absl::Status Status() const;
+
+  // Checks status and acquires database ownership after DML replay checks.
+  absl::Status PrepareDml();
 
   // If status is a constraint error, it invalidates the transaction and sets
   // the transaction status.

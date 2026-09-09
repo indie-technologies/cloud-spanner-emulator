@@ -43,6 +43,9 @@ class SchemaGraph {
     return schema_nodes_;
   }
 
+  // Uses the owning pool's hash set rather than scanning the ordered node list.
+  bool Contains(const SchemaNode* node) const { return pool_->Contains(node); }
+
   // Adds a new node to the graph.
   void Add(std::unique_ptr<const SchemaNode> node_ptr) {
     const SchemaNode* node = node_ptr.get();

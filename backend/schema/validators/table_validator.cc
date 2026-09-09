@@ -427,21 +427,25 @@ absl::Status TableValidator::Validate(const Table* table,
     GOOGLESQL_RET_CHECK_EQ(table->owner_index_->index_data_table(), table);
   }
 
-  // Validate generated columns.
-  GraphDependencyHelper<const Column*, GetColumnName> cycle_detector(
-      /*object_type=*/"generated column");
-  for (const Column* column : table->columns()) {
-    GOOGLESQL_RETURN_IF_ERROR(cycle_detector.AddNodeIfNotExists(column));
-  }
-  for (const Column* column : table->columns()) {
-    if (column->is_generated()) {
-      for (const Column* dep : column->dependent_columns()) {
-        GOOGLESQL_RETURN_IF_ERROR(
-            cycle_detector.AddEdgeIfNotExists(column->Name(), dep->Name()));
+  // Ordinary columns cannot introduce dependency cycles. Avoid allocating and
+  // traversing a graph for every table on every DDL when none are generated.
+  if (absl::c_any_of(table->columns(),
+                     [](const Column* column) { return column->is_generated(); })) {
+    GraphDependencyHelper<const Column*, GetColumnName> cycle_detector(
+        /*object_type=*/"generated column");
+    for (const Column* column : table->columns()) {
+      GOOGLESQL_RETURN_IF_ERROR(cycle_detector.AddNodeIfNotExists(column));
+    }
+    for (const Column* column : table->columns()) {
+      if (column->is_generated()) {
+        for (const Column* dep : column->dependent_columns()) {
+          GOOGLESQL_RETURN_IF_ERROR(
+              cycle_detector.AddEdgeIfNotExists(column->Name(), dep->Name()));
+        }
       }
     }
+    GOOGLESQL_RETURN_IF_ERROR(cycle_detector.DetectCycle());
   }
-  GOOGLESQL_RETURN_IF_ERROR(cycle_detector.DetectCycle());
   GOOGLESQL_RETURN_IF_ERROR(
       ValidateRowDeletionPolicy(table->row_deletion_policy(), table));
 

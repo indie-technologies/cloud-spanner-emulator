@@ -126,9 +126,11 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
 }
 absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
 Database::CreateReadOnlyTransaction(const ReadOnlyOptions& options) {
-  return std::make_unique<ReadOnlyTransaction>(
+  auto transaction = std::make_unique<ReadOnlyTransaction>(
       options, transaction_id_generator_.NextId(), clock_, storage_.get(),
       lock_manager_.get(), versioned_catalog_.get());
+  GOOGLESQL_RETURN_IF_ERROR(transaction->status());
+  return transaction;
 }
 
 absl::StatusOr<std::unique_ptr<ReadWriteTransaction>>
@@ -172,7 +174,10 @@ absl::Status Database::UpdateSchema(
 
   auto context = GetSchemaChangeContext();
   context.schema_change_timestamp = update_timestamp;
-  const Schema* existing_schema = versioned_catalog_->GetLatestSchema();
+  // Keep the previous schema alive until all consumers have switched to the
+  // new one (including lazy action registries and the function catalog).
+  auto existing_snapshot = versioned_catalog_->GetLatestSchemaSnapshot();
+  const Schema* existing_schema = existing_snapshot.get();
   SchemaUpdater updater;
   GOOGLESQL_ASSIGN_OR_RETURN(auto result,
                    updater.UpdateSchemaFromDDL(
@@ -205,13 +210,12 @@ absl::Status Database::UpdateSchema(
   // Enforce the retention period.
   storage_->CleanUpDeletedTables(update_timestamp);
   storage_->CleanUpDeletedColumns(update_timestamp);
-  versioned_catalog_->RemoveExpiredSchemas(update_timestamp);
 
   return absl::OkStatus();
 }
 
-const Schema* Database::GetLatestSchema() const {
-  return versioned_catalog_->GetLatestSchema();
+std::shared_ptr<const Schema> Database::GetLatestSchema() const {
+  return versioned_catalog_->GetLatestSchemaSnapshot();
 }
 
 }  // namespace backend

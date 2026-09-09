@@ -52,6 +52,9 @@ struct QueryContext {
   // context of a read-only transaction and false if the query is executed in
   // the context of a read-write transaction.
   std::optional<bool> is_read_only_txn = std::nullopt;
+
+  // Validate partitioned DML using the same analysis used for execution.
+  bool is_partitioned_dml = false;
 };
 
 }  // namespace backend

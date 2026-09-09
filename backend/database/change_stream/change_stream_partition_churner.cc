@@ -162,77 +162,81 @@ absl::Status ChangeStreamPartitionChurner::ChurnPartitions(
   GOOGLESQL_ASSIGN_OR_RETURN(auto txn, create_read_write_transaction_fn_(
                                  ReadWriteOptions(), RetryState()));
 
-  const Schema* schema = txn->schema();
+  // Pin the schema before looking up nodes and retain ownership through the
+  // complete churn operation, including cursor consumption and commit.
+  return txn->GuardedRequest([&]() -> absl::Status {
+    const Schema* schema = txn->schema();
 
-  GOOGLESQL_RET_CHECK(schema != nullptr);
+    GOOGLESQL_RET_CHECK(schema != nullptr);
 
-  const ChangeStream* change_stream =
-      schema->FindChangeStream(std::string(change_stream_name));
+    const ChangeStream* change_stream =
+        schema->FindChangeStream(std::string(change_stream_name));
 
-  if (change_stream == nullptr) {
-    return absl::OkStatus();
-  }
-
-  // Read the change stream partition table.
-  backend::ReadArg read_arg;
-  read_arg.change_stream_for_partition_table = change_stream->Name();
-  read_arg.columns = {"partition_token", "start_time", "end_time",
-                      "parents",         "children",   "next_churn"};
-  read_arg.key_set = KeySet::All();
-  std::unique_ptr<backend::RowCursor> cursor;
-  absl::Status status = txn->Read(read_arg, &cursor);
-  GOOGLESQL_RETURN_IF_ERROR(status);
-  absl::flat_hash_map<std::string, std::vector<std::string>> churned_partitions;
-  // TODO : Consider optimizing the query to not return stale
-  // tokens, i.e. prefix the token with start timestamp and use key range
-  // prefix.
-  while (cursor->Next()) {
-    // Only retrieve the active tokens that should be churned.
-    if (!cursor->ColumnValue(2).is_null()) {
-      continue;
+    if (change_stream == nullptr) {
+      return absl::OkStatus();
     }
-    const std::string& partition_token = cursor->ColumnValue(0).string_value();
-    const std::string& churn_type = cursor->ColumnValue(5).string_value();
-    const absl::Time start_time = cursor->ColumnValue(1).ToTime();
-    const absl::Time expected_end_time =
-        start_time + absl::GetFlag(FLAGS_change_stream_churning_interval);
-    if (expected_end_time < clock_->Now()) {
-      // Only churn the tokens whose start time is more than the specified
-      // churn interval in the past.
-      if (!churned_partitions.contains(churn_type)) {
-        churned_partitions.emplace(churn_type, std::vector<std::string>());
-      }
-      churned_partitions[churn_type].push_back(partition_token);
-    }
-  }
-  for (const auto& [churn_type, partition_tokens] : churned_partitions) {
-    // Churn the tokens retrieved above.
-    if (churn_type == "MOVE") {
-      // Skip MOVE churning for mutable key range change streams.
-      if (change_stream->partition_mode() ==
-          kChangeStreamPartitionModeMutableKeyRange) {
+
+    // Read the change stream partition table.
+    backend::ReadArg read_arg;
+    read_arg.change_stream_for_partition_table = change_stream->Name();
+    read_arg.columns = {"partition_token", "start_time", "end_time",
+                        "parents",         "children",   "next_churn"};
+    read_arg.key_set = KeySet::All();
+    std::unique_ptr<backend::RowCursor> cursor;
+    absl::Status status = txn->Read(read_arg, &cursor);
+    GOOGLESQL_RETURN_IF_ERROR(status);
+    absl::flat_hash_map<std::string, std::vector<std::string>> churned_partitions;
+    // TODO : Consider optimizing the query to not return stale
+    // tokens, i.e. prefix the token with start timestamp and use key range
+    // prefix.
+    while (cursor->Next()) {
+      // Only retrieve the active tokens that should be churned.
+      if (!cursor->ColumnValue(2).is_null()) {
         continue;
       }
-      // Make sure to move each partition.
-      for (const auto& partition_token : partition_tokens) {
-        GOOGLESQL_RETURN_IF_ERROR(
-            MovePartition(change_stream_name, partition_token, txn.get()));
+      const std::string& partition_token = cursor->ColumnValue(0).string_value();
+      const std::string& churn_type = cursor->ColumnValue(5).string_value();
+      const absl::Time start_time = cursor->ColumnValue(1).ToTime();
+      const absl::Time expected_end_time =
+          start_time + absl::GetFlag(FLAGS_change_stream_churning_interval);
+      if (expected_end_time < clock_->Now()) {
+        // Only churn the tokens whose start time is more than the specified
+        // churn interval in the past.
+        if (!churned_partitions.contains(churn_type)) {
+          churned_partitions.emplace(churn_type, std::vector<std::string>());
+        }
+        churned_partitions[churn_type].push_back(partition_token);
       }
-    } else if (churn_type == "SPLIT") {
-      for (const auto& partition_token : partition_tokens) {
-        GOOGLESQL_RETURN_IF_ERROR(
-            SplitPartition(change_stream_name, partition_token, txn.get()));
-      }
-    } else {
-      int number_of_tokens = partition_tokens.size();
-      // Check that the number of tokens to merge is exactly 2.
-      GOOGLESQL_RET_CHECK(churn_type == "MERGE");
-      GOOGLESQL_RET_CHECK(number_of_tokens == 2);
-      GOOGLESQL_RETURN_IF_ERROR(MergePartition(change_stream_name, partition_tokens[0],
-                                     partition_tokens[1], txn.get()));
     }
-  }
-  return txn->Commit();
+    for (const auto& [churn_type, partition_tokens] : churned_partitions) {
+      // Churn the tokens retrieved above.
+      if (churn_type == "MOVE") {
+        // Skip MOVE churning for mutable key range change streams.
+        if (change_stream->partition_mode() ==
+            kChangeStreamPartitionModeMutableKeyRange) {
+          continue;
+        }
+        // Make sure to move each partition.
+        for (const auto& partition_token : partition_tokens) {
+          GOOGLESQL_RETURN_IF_ERROR(
+              MovePartition(change_stream_name, partition_token, txn.get()));
+        }
+      } else if (churn_type == "SPLIT") {
+        for (const auto& partition_token : partition_tokens) {
+          GOOGLESQL_RETURN_IF_ERROR(
+              SplitPartition(change_stream_name, partition_token, txn.get()));
+        }
+      } else {
+        int number_of_tokens = partition_tokens.size();
+        // Check that the number of tokens to merge is exactly 2.
+        GOOGLESQL_RET_CHECK(churn_type == "MERGE");
+        GOOGLESQL_RET_CHECK(number_of_tokens == 2);
+        GOOGLESQL_RETURN_IF_ERROR(MergePartition(change_stream_name, partition_tokens[0],
+                                       partition_tokens[1], txn.get()));
+      }
+    }
+    return txn->Commit();
+  });
 }
 
 absl::Status ChangeStreamPartitionChurner::MovePartition(

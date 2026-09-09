@@ -107,8 +107,8 @@ class Database {
       int* num_succesful_statements, absl::Time* commit_timestamp,
       absl::Status* backfill_status);
 
-  // Retrives the current version of the schema.
-  const Schema* GetLatestSchema() const;
+  // Pins the current schema for an admin request, independently of DDL.
+  std::shared_ptr<const Schema> GetLatestSchema() const;
 
   // Used to execute queries against the database.
   QueryEngine* query_engine() { return query_engine_.get(); }
@@ -157,13 +157,13 @@ class Database {
   // Type factory used for all GoogleSQL operations on this database.
   std::unique_ptr<googlesql::TypeFactory> type_factory_;
 
-  // Versioned catalog of this database.
+  // Current schema catalog of this database.
   std::unique_ptr<VersionedCatalog> versioned_catalog_;
 
   // Query engine of the database.
   std::unique_ptr<QueryEngine> query_engine_;
 
-  // Maintains an action registry per schema.
+  // Lazily builds the action registry for the current schema.
   std::unique_ptr<ActionManager> action_manager_;
 
   // The database dialect.

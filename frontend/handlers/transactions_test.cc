@@ -82,6 +82,82 @@ INSTANTIATE_TEST_SUITE_P(SessionTypes, TransactionApiTest,
                          testing::Values(SessionType::kRegularSession,
                                          SessionType::kMultiplexedSession));
 
+TEST_P(TransactionApiTest, IdleReadOnlyTransactionCannotResumeAfterWriter) {
+  const auto session =
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession);
+  spanner_api::BeginTransactionRequest begin;
+  begin.set_session(session);
+  begin.mutable_options()->mutable_read_only()->set_strong(true);
+  spanner_api::Transaction reader;
+  GOOGLESQL_ASSERT_OK(BeginTransaction(begin, &reader));
+
+  spanner_api::ExecuteSqlRequest query;
+  query.set_session(session);
+  query.mutable_transaction()->set_id(reader.id());
+  query.set_sql("SELECT 1");
+  spanner_api::ResultSet rows;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(query, &rows));
+
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto writer_session,
+                               CreateTestSession(/*multiplexed=*/false));
+  spanner_api::CommitRequest commit;
+  commit.set_session(writer_session);
+  commit.mutable_single_use_transaction()->mutable_read_write();
+  spanner_api::CommitResponse response;
+  GOOGLESQL_ASSERT_OK(Commit(commit, &response));
+
+  spanner_api::PartitionReadRequest partition_read;
+  partition_read.set_session(session);
+  partition_read.mutable_transaction()->set_id(reader.id());
+  partition_read.set_table("test_table");
+  partition_read.mutable_key_set()->set_all(true);
+  spanner_api::PartitionResponse partitions;
+  EXPECT_THAT(PartitionRead(partition_read, &partitions),
+              StatusIs(absl::StatusCode::kAborted));
+  spanner_api::PartitionQueryRequest partition_query;
+  partition_query.set_session(session);
+  partition_query.mutable_transaction()->set_id(reader.id());
+  partition_query.set_sql("SELECT 1");
+  grpc::ClientContext partition_context;
+  EXPECT_THAT(test_env()->spanner_client()->PartitionQuery(
+                  &partition_context, partition_query, &partitions),
+              StatusIs(absl::StatusCode::kAborted));
+
+  // Even a constant query must reject the old transaction, rather than silently
+  // changing its snapshot or bypassing the lock through a query without reads.
+  EXPECT_THAT(ExecuteSql(query, &rows), StatusIs(absl::StatusCode::kAborted));
+}
+
+TEST_P(TransactionApiTest, SingleUseReadReleasesOwnershipAfterRequest) {
+  const auto session =
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession);
+  spanner_api::ExecuteSqlRequest query;
+  query.set_session(session);
+  query.mutable_transaction()->mutable_single_use()->mutable_read_only();
+  query.set_sql("SELECT 1");
+  spanner_api::ResultSet rows;
+  GOOGLESQL_ASSERT_OK(ExecuteSql(query, &rows));
+
+  spanner_api::CommitRequest commit;
+  commit.set_session(session);
+  commit.mutable_single_use_transaction()->mutable_read_write();
+  spanner_api::CommitResponse response;
+  GOOGLESQL_EXPECT_OK(Commit(commit, &response));
+}
+
+TEST_P(TransactionApiTest, HistoricalReadTimestampIsUnsupported) {
+  spanner_api::BeginTransactionRequest begin;
+  begin.set_session(
+      GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession));
+  begin.mutable_options()
+      ->mutable_read_only()
+      ->mutable_read_timestamp()
+      ->set_seconds(1);
+  spanner_api::Transaction reader;
+  EXPECT_THAT(BeginTransaction(begin, &reader),
+              StatusIs(absl::StatusCode::kUnimplemented));
+}
+
 TEST_P(TransactionApiTest, CanBeginTransaction) {
   spanner_api::BeginTransactionRequest request = PARSE_TEXT_PROTO(R"(
     options { read_only {} }
@@ -705,7 +781,8 @@ TEST_P(TransactionApiTest, CommitMultiplexedSessionIsolation) {
   EXPECT_FALSE(commit_response1.has_commit_timestamp());
 
   // 2. Read from a DIFFERENT transaction/session (Single Use).
-  //    Expect: Data NOT found.
+  //    Contention aborts either the reader or the idle writer. Uncommitted
+  //    values must never become visible in either case.
   spanner_api::ReadRequest read_request = PARSE_TEXT_PROTO(R"pb(
     table: "test_table"
     columns: "string_col"
@@ -713,8 +790,16 @@ TEST_P(TransactionApiTest, CommitMultiplexedSessionIsolation) {
   )pb");
   read_request.set_session(GetSessionUri(true));
   spanner_api::ResultSet read_response;
-  GOOGLESQL_EXPECT_OK(Read(read_request, &read_response));
-  EXPECT_EQ(read_response.rows_size(), 0);  // Should be empty!
+  const auto read_status = Read(read_request, &read_response);
+  EXPECT_TRUE(read_status.ok() || absl::IsAborted(read_status)) << read_status;
+  EXPECT_EQ(read_response.rows_size(), 0);
+
+  spanner_api::RollbackRequest rollback;
+  rollback.set_session(GetSessionUri(true));
+  rollback.set_transaction_id(begin_response.id());
+  GOOGLESQL_ASSERT_OK(Rollback(rollback));
+  GOOGLESQL_ASSERT_OK(Read(read_request, &read_response));
+  EXPECT_EQ(read_response.rows_size(), 0);
 }
 
 }  // namespace

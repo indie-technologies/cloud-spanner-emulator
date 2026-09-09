@@ -207,6 +207,12 @@ Catalog::Catalog(
     const absl::flat_hash_map<std::string, google::protobuf::Value>&
         secure_context)
     : schema_(schema),
+      analyzer_options_(options),
+      reader_(reader),
+      internal_change_stream_(
+          change_stream_internal_lookup.has_value()
+              ? schema->FindChangeStream(*change_stream_internal_lookup)
+              : nullptr),
       function_catalog_(function_catalog),
       type_factory_(type_factory),
       secure_context_(secure_context) {
@@ -219,7 +225,10 @@ Catalog::Catalog(
       CreateSecureContextFunction("Spanner", secure_context_);
   for (const auto* named_schema : schema->named_schemas()) {
     named_schemas_[named_schema->Name()] =
-        std::make_unique<QueryableNamedSchema>(named_schema);
+        std::make_unique<QueryableNamedSchema>(
+            named_schema, [this](const std::string& name) {
+              return FindOrCreateTable(name);
+            });
   }
 
   for (const auto* udf : schema->udfs()) {
@@ -255,36 +264,6 @@ Catalog::Catalog(
     } else {
       sequences_[sequence->Name()] =
           std::make_unique<QueryableSequence>(sequence);
-    }
-  }
-
-  // Pass the reader to tables.
-  for (const auto* table : schema->tables()) {
-    std::string name = table->Name();
-    if (SDLObjectName::IsFullyQualifiedName(name)) {
-      absl::Status status = AddObjectToNamedSchema(
-          std::string(SDLObjectName::GetSchemaName(name)),
-          std::make_unique<QueryableTable>(table, reader, options, this,
-                                           type_factory));
-      LOG_IF(ERROR, !status.ok()) << status.message();
-    } else {
-      tables_[table->Name()] = std::make_unique<QueryableTable>(
-          table, reader, options, this, type_factory);
-    }
-
-    std::string synonym_name = table->synonym();
-    if (!synonym_name.empty()) {
-      if (SDLObjectName::IsFullyQualifiedName(synonym_name)) {
-        absl::Status status = AddObjectToNamedSchema(
-            std::string(SDLObjectName::GetSchemaName(synonym_name)),
-            std::make_unique<QueryableTable>(table, reader, options, this,
-                                             type_factory,
-                                             /*is_synonym=*/true));
-        LOG_IF(ERROR, !status.ok()) << status.message();
-      } else {
-        tables_[synonym_name] = std::make_unique<QueryableTable>(
-            table, reader, options, this, type_factory, /*is_synonym=*/true);
-      }
     }
   }
 
@@ -342,16 +321,6 @@ Catalog::Catalog(
     }
   }
 
-  if (change_stream_internal_lookup.has_value()) {
-    auto change_stream =
-        schema->FindChangeStream(change_stream_internal_lookup.value());
-    auto partition_table = change_stream->change_stream_partition_table();
-    auto data_table = change_stream->change_stream_data_table();
-    tables_[partition_table->Name()] = std::make_unique<QueryableTable>(
-        partition_table, reader, options, this, type_factory);
-    tables_[data_table->Name()] = std::make_unique<QueryableTable>(
-        data_table, reader, options, this, type_factory);
-  }
   // Register a table valued function for each active change stream
   for (const auto* change_stream : schema->change_streams()) {
     tvfs_[change_stream->tvf_name()] =
@@ -361,16 +330,6 @@ Catalog::Catalog(
                 database_api::DatabaseDialect::POSTGRESQL,
             /*is_mutable_key_range=*/change_stream->partition_mode() ==
                 kChangeStreamPartitionModeMutableKeyRange));
-  }
-
-  // Read types.
-  for (const auto& tablepair : tables_) {
-    const QueryableTable* table = tablepair.second.get();
-    for (int i = 0; i < table->NumColumns(); ++i) {
-      std::string type_name = table->GetColumn(i)->GetType()->TypeName(
-          googlesql::PRODUCT_EXTERNAL, /*use_external_float32=*/true);
-      types_[type_name] = table->GetColumn(i)->GetType();
-    }
   }
 
   if (absl::Status status = PopulateSystemProcedureMap(); !status.ok()) {
@@ -424,6 +383,60 @@ absl::Status Catalog::GetCatalog(const std::string& name,
   return absl::OkStatus();
 }
 
+const QueryableTable* Catalog::FindOrCreateTable(const std::string& name) const {
+  {
+    absl::MutexLock lock(tables_mu_);
+    if (auto it = tables_.find(name); it != tables_.end()) {
+      return it->second.get();
+    }
+  }
+
+  const Table* table = schema_->FindTable(name);
+  if (table == nullptr && internal_change_stream_ != nullptr) {
+    for (const Table* internal_table :
+         {internal_change_stream_->change_stream_partition_table(),
+          internal_change_stream_->change_stream_data_table()}) {
+      if (absl::EqualsIgnoreCase(name, internal_table->Name())) {
+        table = internal_table;
+        break;
+      }
+    }
+  }
+  if (table == nullptr) return nullptr;
+
+  // Column expression analysis can call back into this catalog. Construct
+  // outside the cache lock, then retain one wrapper if lookups race.
+  auto queryable_table = std::make_unique<const QueryableTable>(
+      table, reader_, &analyzer_options_, const_cast<Catalog*>(this), type_factory_,
+      /*is_synonym=*/!absl::EqualsIgnoreCase(name, table->Name()));
+  absl::MutexLock lock(tables_mu_);
+  auto [it, inserted] = tables_.try_emplace(name, std::move(queryable_table));
+  return it->second.get();
+}
+
+void Catalog::InitializeTypes() const {
+  absl::call_once(types_once_, [this] {
+    auto add_types = [this](const Table* table) {
+      for (const auto* column : table->columns()) {
+        const auto* type = column->GetType();
+        types_[type->TypeName(googlesql::PRODUCT_EXTERNAL,
+                             /*use_external_float32=*/true)] = type;
+      }
+    };
+    for (const auto* table : schema_->tables()) {
+      if (!SDLObjectName::IsFullyQualifiedName(table->Name()) ||
+          (!table->synonym().empty() &&
+           !SDLObjectName::IsFullyQualifiedName(table->synonym()))) {
+        add_types(table);
+      }
+    }
+    if (internal_change_stream_ != nullptr) {
+      add_types(internal_change_stream_->change_stream_partition_table());
+      add_types(internal_change_stream_->change_stream_data_table());
+    }
+  });
+}
+
 absl::Status Catalog::GetTable(const std::string& name,
                                const googlesql::Table** table,
                                const FindOptions& options) {
@@ -433,9 +446,11 @@ absl::Status Catalog::GetTable(const std::string& name,
     return absl::OkStatus();
   }
 
-  if (auto it = tables_.find(name); it != tables_.end()) {
-    *table = it->second.get();
-    return absl::OkStatus();
+  // A dotted identifier is not a table in the root catalog. Qualified names
+  // must be resolved through the corresponding named catalog.
+  if (!SDLObjectName::IsFullyQualifiedName(name)) {
+    *table = FindOrCreateTable(name);
+    if (*table != nullptr) return absl::OkStatus();
   }
 
   return error::TableNotFound(name);
@@ -546,8 +561,20 @@ absl::Status Catalog::GetCatalogs(
 
 absl::Status Catalog::GetTables(
     absl::flat_hash_set<const googlesql::Table*>* output) const {
-  for (auto iter = tables_.begin(); iter != tables_.end(); ++iter) {
-    output->insert(iter->second.get());
+  for (const auto* table : schema_->tables()) {
+    if (!SDLObjectName::IsFullyQualifiedName(table->Name())) {
+      output->insert(FindOrCreateTable(table->Name()));
+    }
+    if (!table->synonym().empty() &&
+        !SDLObjectName::IsFullyQualifiedName(table->synonym())) {
+      output->insert(FindOrCreateTable(table->synonym()));
+    }
+  }
+  if (internal_change_stream_ != nullptr) {
+    output->insert(FindOrCreateTable(
+        internal_change_stream_->change_stream_partition_table()->Name()));
+    output->insert(FindOrCreateTable(
+        internal_change_stream_->change_stream_data_table()->Name()));
   }
   for (auto iter = views_.begin(); iter != views_.end(); ++iter) {
     output->insert(iter->second.get());
@@ -557,6 +584,7 @@ absl::Status Catalog::GetTables(
 
 absl::Status Catalog::GetTypes(
     absl::flat_hash_set<const googlesql::Type*>* output) const {
+  InitializeTypes();
   for (const auto& [unused_name, type] : types_) {
     output->insert(type);
   }
@@ -567,6 +595,7 @@ absl::Status Catalog::GetType(const std::string& name,
                               const googlesql::Type** type,
                               const FindOptions& options) {
   *type = nullptr;
+  InitializeTypes();
   if (auto it = types_.find(name); it != types_.end()) {
     *type = it->second;
     return absl::OkStatus();

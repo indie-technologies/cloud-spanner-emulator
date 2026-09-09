@@ -17,6 +17,7 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_TRANSACTION_READ_WRITE_TRANSACTION_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_TRANSACTION_READ_WRITE_TRANSACTION_H_
 
+#include <functional>
 #include <memory>
 #include <queue>
 
@@ -86,6 +87,16 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
                        const VersionedCatalog* const versioned_catalog,
                        ActionManager* action_manager);
 
+  ~ReadWriteTransaction() override;
+
+  // Holds off aborts for the entire frontend request, including SQL evaluation
+  // and streaming. Acquire the database lock before resolving the schema.
+  absl::Status GuardedRequest(const std::function<absl::Status()>& fn,
+                             bool acquire_lock = true);
+
+  // DML calls this after checking cached sequence-number responses.
+  absl::Status EnsureActive();
+
   absl::Status Read(const ReadArg& read_arg,
                     std::unique_ptr<RowCursor>* cursor) override
       ABSL_LOCKS_EXCLUDED(mu_);
@@ -110,7 +121,8 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
     return state_;
   }
 
-  // Returns the schema used by this transaction.
+  // Returns the schema used by this transaction. Call inside GuardedRequest()
+  // when resolving nodes so initialization and schema changes cannot race.
   const Schema* schema() const ABSL_LOCKS_EXCLUDED(mu_);
 
   // Returns the ID of this transaction.
@@ -166,6 +178,7 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
 
   // Mutex that guards the state of this transaction.
   mutable absl::Mutex mu_;
+  absl::Mutex request_mu_;
 
   // Options with which the transaction was created.
   ReadWriteOptions options_;
@@ -185,6 +198,9 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
   // Catalog of schemas.
   const VersionedCatalog* const versioned_catalog_;
 
+  // Must outlive buffered operations and action context that reference nodes.
+  std::shared_ptr<const Schema> schema_snapshot_;
+
   // Transaction lock management.
   std::unique_ptr<LockHandle> lock_handle_;
 
@@ -197,7 +213,7 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
 
   // Action Manager for the transaction.
   ActionManager* action_manager_;
-  ActionRegistry* action_registry_;
+  ActionRegistry* action_registry_ = nullptr;
   std::unique_ptr<ActionContext> action_context_;
 
   // The commit timestamp chosen for this transaction.

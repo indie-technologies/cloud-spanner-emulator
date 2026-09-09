@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
@@ -65,8 +66,10 @@ cc_library(
         "//backend/datamodel:key",
         "//backend/datamodel:key_range",
         "//common:errors",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_googlesql//googlesql/public:value",
     ],
@@ -119,5 +122,21 @@ cc_test(
         "@com_google_googlesql//googlesql/base/testing:status_matchers",
         "@com_google_googlesql//googlesql/public:value",
         "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_binary(
+    name = "in_memory_storage_benchmark",
+    testonly = True,
+    srcs = ["in_memory_storage_benchmark.cc"],
+    deps = [
+        ":in_memory_storage",
+        ":iterator",
+        "//backend/common:ids",
+        "//backend/datamodel:key",
+        "//backend/datamodel:key_range",
+        "@com_github_google_benchmark//:benchmark",
+        "@com_google_absl//absl/time",
+        "@com_google_googlesql//googlesql/public:value",
     ],
 )

@@ -20,12 +20,12 @@
 #include <utility>
 #include <vector>
 
-#include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
 #include "backend/access/read.h"
 #include "backend/common/ids.h"
+#include "backend/common/rows.h"
 #include "backend/datamodel/key_set.h"
 #include "backend/locking/manager.h"
 #include "backend/storage/in_memory_iterator.h"
@@ -49,104 +49,94 @@ ReadOnlyTransaction::ReadOnlyTransaction(
       id_(transaction_id),
       clock_(clock),
       base_storage_(storage),
-      versioned_catalog_(versioned_catalog),
-      lock_manager_(lock_manager),
-      version_retention_period_(versioned_catalog->version_retention_period()) {
-  lock_handle_ = lock_manager_->CreateHandle(transaction_id,
-                                             /*try_abort_fn=*/nullptr,
-                                             /*priority=*/1);
-  read_timestamp_ = PickReadTimestamp();
+      versioned_catalog_(versioned_catalog) {
+  absl::MutexLock lock(mu_);
+  lock_handle_ = lock_manager->CreateHandle(
+      transaction_id, [this] { return TryAbort(); }, /*priority=*/1,
+      /*abort_on_contention=*/true);
+  if (options.bound != TimestampBound::kStrongRead) {
+    status_ = absl::UnimplementedError(
+        "Only strong reads are supported by this single-version emulator");
+    return;
+  }
+  lock_handle_->EnqueueLock(
+      LockRequest(LockMode::kShared, "", KeyRange::All(), {}));
+  status_ = lock_handle_->Wait();
+  if (status_.ok()) {
+    // Select the schema and timestamp only after excluding writers and DDL.
+    read_timestamp_ = clock_->Now();
+    schema_snapshot_ = versioned_catalog_->GetLatestSchemaSnapshot();
+    schema_ = schema_snapshot_.get();
+  }
+}
+
+ReadOnlyTransaction::~ReadOnlyTransaction() { Close(); }
+
+absl::Status ReadOnlyTransaction::status() const {
+  absl::MutexLock lock(mu_);
+  return status_;
+}
+
+void ReadOnlyTransaction::Close() {
+  absl::MutexLock lock(mu_);
+  if (status_.ok()) status_ = error::TransactionClosed(id_);
+  if (active_requests_ == 0) lock_handle_->UnlockAll();
+}
+
+absl::Status ReadOnlyTransaction::TryAbort() {
+  // Called while the lock manager is locked. Never wait for this mutex or
+  // attempt to release the database lock here; the manager hands it over.
+  if (!mu_.try_lock()) return error::CouldNotObtainTransactionMutex(id_);
+  if (active_requests_ != 0) {
+    mu_.unlock();
+    return error::CouldNotObtainTransactionMutex(id_);
+  }
+  status_ = absl::AbortedError(
+      "Read-only transaction aborted by a competing transaction");
+  mu_.unlock();
+  return absl::OkStatus();
+}
+
+absl::Status ReadOnlyTransaction::GuardedCall(
+    const std::function<absl::Status()>& fn) {
+  {
+    absl::MutexLock lock(mu_);
+    GOOGLESQL_RETURN_IF_ERROR(status_);
+    ++active_requests_;
+  }
+  const absl::Status result = fn();
+  {
+    absl::MutexLock lock(mu_);
+    --active_requests_;
+    if (active_requests_ == 0 && !status_.ok()) lock_handle_->UnlockAll();
+  }
+  return result;
 }
 
 absl::Status ReadOnlyTransaction::Read(const ReadArg& read_arg,
                                        std::unique_ptr<RowCursor>* cursor) {
-  absl::MutexLock lock(mu_);
-  // Wait for any concurrent schema change or read-write transactions to commit
-  // before accessing database state to perform a read.
-  lock_handle_->WaitForSafeRead(read_timestamp_);
-  auto now = clock_->Now();
-  if (now - read_timestamp_ >= version_retention_period_) {
-    return error::ReadTimestampPastVersionGCLimit(read_timestamp_);
-  }
+  return GuardedCall([&]() -> absl::Status {
+    auto now = clock_->Now();
+    GOOGLESQL_ASSIGN_OR_RETURN(const ResolvedReadArg resolved_read_arg,
+                     ResolveReadArg(read_arg, schema()));
 
-  GOOGLESQL_ASSIGN_OR_RETURN(const ResolvedReadArg resolved_read_arg,
-                   ResolveReadArg(read_arg, schema()));
+    // Clean up any dropped tables that are eligible for deletion.
+    // This is inexpensive to do so it can be done for every read.
+    // If there are no tables to clean up, this is a no-op.
+    base_storage_->CleanUpDeletedTables(now);
 
-  // Clean up any dropped tables that are eligible for deletion.
-  // This is inexpensive to do so it can be done for every read.
-  // If there are no tables to clean up, this is a no-op.
-  base_storage_->CleanUpDeletedTables(now);
-
-  std::vector<std::unique_ptr<StorageIterator>> iterators;
-  for (const auto& key_range : resolved_read_arg.key_ranges) {
-    std::unique_ptr<StorageIterator> itr;
-    GOOGLESQL_RETURN_IF_ERROR(base_storage_->Read(
-        read_timestamp_, resolved_read_arg.table->id(), key_range,
-        GetColumnIDs(resolved_read_arg.columns), &itr));
-    iterators.push_back(std::move(itr));
-  }
-  *cursor = std::make_unique<StorageIteratorRowCursor>(
-      std::move(iterators), resolved_read_arg.columns);
-  return absl::OkStatus();
-}
-
-const Schema* ReadOnlyTransaction::schema() const {
-  // Wait for any concurrent schema change or read-write transactions to commit
-  // before accessing database state to read schemas in versioned_catalog.
-  lock_handle_->WaitForSafeRead(read_timestamp_);
-  return versioned_catalog_->GetSchema(read_timestamp_);
-}
-
-absl::Time ReadOnlyTransaction::PickReadTimestamp() {
-  auto get_random_stale_timestamp =
-      [this](absl::Time min_timestamp) -> absl::Time {
-    // Any reads performed on or before last_commit_timestamp are guaranteed to
-    // see a consistent snapshots of all the commits that have already finished.
-    // Thus, picked read timestamp need not be older than last_commit_timestamp.
-    absl::Time last_commit_timestamp = lock_manager_->LastCommitTimestamp();
-    if (min_timestamp < last_commit_timestamp) {
-      min_timestamp = last_commit_timestamp;
+    std::vector<std::unique_ptr<StorageIterator>> iterators;
+    for (const auto& key_range : resolved_read_arg.key_ranges) {
+      std::unique_ptr<StorageIterator> itr;
+      GOOGLESQL_RETURN_IF_ERROR(base_storage_->Read(
+          read_timestamp_, resolved_read_arg.table->id(), key_range,
+          GetColumnIDs(resolved_read_arg.columns), &itr));
+      iterators.push_back(std::move(itr));
     }
-    absl::BitGen gen;
-    int64_t random_staleness = absl::Uniform<int64_t>(
-        gen, 0, absl::ToInt64Microseconds(clock_->Now() - min_timestamp));
-    return clock_->Now() - absl::Microseconds(random_staleness);
-  };
-  switch (options_.bound) {
-    case TimestampBound::kStrongRead: {
-      read_timestamp_ = clock_->Now();
-      break;
-    }
-    case TimestampBound::kExactTimestamp: {
-      read_timestamp_ = options_.timestamp;
-      break;
-    }
-    case TimestampBound::kExactStaleness: {
-      read_timestamp_ = clock_->Now() - options_.staleness;
-      break;
-    }
-    case TimestampBound::kMinTimestamp: {
-      if (options_.timestamp >= clock_->Now()) {
-        // If min timestamp bound is set in future, we want to wait until that
-        // time arrives before returning a read result, thus set read_timestamp
-        // to be same as the min timestamp provided.
-        read_timestamp_ = options_.timestamp;
-      } else {
-        // Randomly choose staleness to mimic production behavior of reading
-        // from potentially lagging replicas.
-        read_timestamp_ = get_random_stale_timestamp(options_.timestamp);
-      }
-      break;
-    }
-    case TimestampBound::kMaxStaleness: {
-      // Randomly choose staleness to mimic production behavior of reading from
-      // potentially lagging replicas. Bounded staleness cannot be negative.
-      read_timestamp_ =
-          get_random_stale_timestamp(clock_->Now() - options_.staleness);
-      break;
-    }
-  }
-  return read_timestamp_;
+    *cursor = std::make_unique<StorageIteratorRowCursor>(
+        std::move(iterators), resolved_read_arg.columns);
+    return absl::OkStatus();
+  });
 }
 
 }  // namespace backend

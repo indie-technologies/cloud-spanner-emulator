@@ -16,7 +16,6 @@
 
 #include "frontend/converters/reads.h"
 
-#include <limits>
 #include <vector>
 
 #include "google/protobuf/struct.pb.h"
@@ -41,7 +40,6 @@
 #include "frontend/converters/chunking.h"
 #include "frontend/converters/keys.h"
 #include "frontend/converters/partition.h"
-#include "frontend/converters/time.h"
 #include "frontend/converters/types.h"
 #include "frontend/converters/values.h"
 #include "frontend/proto/partition_token.pb.h"
@@ -66,29 +64,6 @@ absl::Status ResultSetMetadataToProto(backend::RowCursor* cursor,
         TypeToProto(cursor->ColumnType(i), field_pb->mutable_type()))
         << " when converting column " << cursor->ColumnName(i) << " of type "
         << cursor->ColumnType(i) << " at position " << i << " in row cursor";
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ValidateStaleness(absl::Duration staleness) {
-  if (staleness < absl::ZeroDuration()) {
-    return error::StalenessMustBeNonNegative();
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ValidateMinReadTimestamp(absl::Time min_read_timestamp) {
-  const int64_t timestamp = absl::ToUnixMicros(min_read_timestamp);
-  if (timestamp < 0 || timestamp == std::numeric_limits<int64_t>::max()) {
-    return error::InvalidMinReadTimestamp(min_read_timestamp);
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ValidateExactReadTimestamp(absl::Time exact_read_timestamp) {
-  const int64_t timestamp = absl::ToUnixMicros(exact_read_timestamp);
-  if (timestamp < 0 || timestamp == std::numeric_limits<int64_t>::max()) {
-    return error::InvalidExactReadTimestamp(exact_read_timestamp);
   }
   return absl::OkStatus();
 }
@@ -136,44 +111,15 @@ absl::StatusOr<backend::ReadOnlyOptions> ReadOnlyOptionsFromProto(
     const spanner_api::TransactionOptions::ReadOnly& proto) {
   using ReadOnly = spanner_api::TransactionOptions::ReadOnly;
   backend::ReadOnlyOptions options;
-  switch (proto.timestamp_bound_case()) {
-    case ReadOnly::kMinReadTimestamp: {
-      GOOGLESQL_ASSIGN_OR_RETURN(options.timestamp,
-                       TimestampFromProto(proto.min_read_timestamp()));
-      GOOGLESQL_RETURN_IF_ERROR(ValidateMinReadTimestamp(options.timestamp));
-      options.bound = backend::TimestampBound::kMinTimestamp;
-      break;
-    }
-    case ReadOnly::kMaxStaleness: {
-      GOOGLESQL_ASSIGN_OR_RETURN(options.staleness,
-                       DurationFromProto(proto.max_staleness()));
-      GOOGLESQL_RETURN_IF_ERROR(ValidateStaleness(options.staleness));
-      options.bound = backend::TimestampBound::kMaxStaleness;
-      break;
-    }
-    case ReadOnly::kReadTimestamp: {
-      GOOGLESQL_ASSIGN_OR_RETURN(options.timestamp,
-                       TimestampFromProto(proto.read_timestamp()));
-      GOOGLESQL_RETURN_IF_ERROR(ValidateExactReadTimestamp(options.timestamp));
-      options.bound = backend::TimestampBound::kExactTimestamp;
-      break;
-    }
-    case ReadOnly::kExactStaleness: {
-      GOOGLESQL_ASSIGN_OR_RETURN(options.staleness,
-                       DurationFromProto(proto.exact_staleness()));
-      GOOGLESQL_RETURN_IF_ERROR(ValidateStaleness(options.staleness));
-      options.bound = backend::TimestampBound::kExactStaleness;
-      break;
-    }
-    case ReadOnly::kStrong:
-      if (!proto.strong()) {
-        return error::StrongReadOptionShouldBeTrue();
-      }
-      ABSL_FALLTHROUGH_INTENDED;
-    case ReadOnly::TIMESTAMP_BOUND_NOT_SET:
-      options.bound = backend::TimestampBound::kStrongRead;
-      break;
+  if (proto.timestamp_bound_case() != ReadOnly::kStrong &&
+      proto.timestamp_bound_case() != ReadOnly::TIMESTAMP_BOUND_NOT_SET) {
+    return absl::UnimplementedError(
+        "Only strong reads are supported by this single-version emulator");
   }
+  if (proto.timestamp_bound_case() == ReadOnly::kStrong && !proto.strong()) {
+    return error::StrongReadOptionShouldBeTrue();
+  }
+  options.bound = backend::TimestampBound::kStrongRead;
   return options;
 }
 

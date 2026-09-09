@@ -187,34 +187,36 @@ absl::Status PartitionRead(RequestContext* ctx,
     return error::PartitionReadNeedsReadOnlyTxn();
   }
 
-  if (request->has_partition_options()) {
-    GOOGLESQL_RETURN_IF_ERROR(ValidatePartitionOptions(request->partition_options()));
-  }
+  return txn->GuardedCall(Transaction::OpType::kRead, [&]() -> absl::Status {
+    if (request->has_partition_options()) {
+      GOOGLESQL_RETURN_IF_ERROR(ValidatePartitionOptions(request->partition_options()));
+    }
 
-  if (ShouldReturnTransaction(request->transaction())) {
-    GOOGLESQL_ASSIGN_OR_RETURN(*response->mutable_transaction(), txn->ToProto());
-  }
+    if (ShouldReturnTransaction(request->transaction())) {
+      GOOGLESQL_ASSIGN_OR_RETURN(*response->mutable_transaction(), txn->ToProto());
+    }
 
-  // Add two partitions to result set, with first partition being empty.
-  GOOGLESQL_ASSIGN_OR_RETURN(
-      auto empty_partition_token,
-      CreatePartitionTokenForRead(*request, txn->id(), spanner_api::KeySet()));
-  spanner_api::Partition empty_partition;
-  GOOGLESQL_ASSIGN_OR_RETURN(*empty_partition.mutable_partition_token(),
-                   PartitionTokenToString(empty_partition_token));
+    // Add two partitions to result set, with first partition being empty.
+    GOOGLESQL_ASSIGN_OR_RETURN(
+        auto empty_partition_token,
+        CreatePartitionTokenForRead(*request, txn->id(), spanner_api::KeySet()));
+    spanner_api::Partition empty_partition;
+    GOOGLESQL_ASSIGN_OR_RETURN(*empty_partition.mutable_partition_token(),
+                     PartitionTokenToString(empty_partition_token));
 
-  // Second partition contains full result set for requested key_set.
-  GOOGLESQL_ASSIGN_OR_RETURN(
-      auto full_partition_token,
-      CreatePartitionTokenForRead(*request, txn->id(), request->key_set()));
-  spanner_api::Partition full_partition;
-  GOOGLESQL_ASSIGN_OR_RETURN(*full_partition.mutable_partition_token(),
-                   PartitionTokenToString(full_partition_token));
+    // Second partition contains full result set for requested key_set.
+    GOOGLESQL_ASSIGN_OR_RETURN(
+        auto full_partition_token,
+        CreatePartitionTokenForRead(*request, txn->id(), request->key_set()));
+    spanner_api::Partition full_partition;
+    GOOGLESQL_ASSIGN_OR_RETURN(*full_partition.mutable_partition_token(),
+                     PartitionTokenToString(full_partition_token));
 
-  *response->mutable_partitions()->Add() = empty_partition;
-  *response->mutable_partitions()->Add() = full_partition;
+    *response->mutable_partitions()->Add() = empty_partition;
+    *response->mutable_partitions()->Add() = full_partition;
 
-  return absl::OkStatus();
+    return absl::OkStatus();
+  });
 }
 REGISTER_GRPC_HANDLER(Spanner, PartitionRead);
 
@@ -228,47 +230,47 @@ absl::Status PartitionQuery(RequestContext* ctx,
   auto session = session_and_txn.session;
   auto txn = session_and_txn.transaction;
 
-  if (request->has_partition_options()) {
-    GOOGLESQL_RETURN_IF_ERROR(ValidatePartitionOptions(request->partition_options()));
-  }
+  return txn->GuardedCall(Transaction::OpType::kSql, [&]() -> absl::Status {
+    if (request->has_partition_options()) {
+      GOOGLESQL_RETURN_IF_ERROR(ValidatePartitionOptions(request->partition_options()));
+    }
 
-  if (ShouldReturnTransaction(request->transaction())) {
-    GOOGLESQL_ASSIGN_OR_RETURN(*response->mutable_transaction(), txn->ToProto());
-  }
+    if (ShouldReturnTransaction(request->transaction())) {
+      GOOGLESQL_ASSIGN_OR_RETURN(*response->mutable_transaction(), txn->ToProto());
+    }
 
-  // check query is partitionable.
-  GOOGLESQL_ASSIGN_OR_RETURN(
-      backend::Query query,
-      QueryFromProto(request->sql(), request->params(), request->param_types(),
-                     txn->query_engine()->type_factory()
-                     ,
-                     txn->schema()->proto_bundle()
-                     ));
-  GOOGLESQL_RETURN_IF_ERROR(txn->query_engine()->IsPartitionable(
-      query,
-      backend::QueryContext{
-          .schema = txn->schema(), .reader = nullptr, .writer = nullptr}));
+    // check query is partitionable.
+    GOOGLESQL_ASSIGN_OR_RETURN(
+        backend::Query query,
+        QueryFromProto(request->sql(), request->params(), request->param_types(),
+                       txn->query_engine()->type_factory(),
+                       txn->schema()->proto_bundle()));
+    GOOGLESQL_RETURN_IF_ERROR(txn->query_engine()->IsPartitionable(
+        query,
+        backend::QueryContext{
+            .schema = txn->schema(), .reader = nullptr, .writer = nullptr}));
 
-  // Add two partitions to result set, with first partition being empty.
-  GOOGLESQL_ASSIGN_OR_RETURN(auto empty_partition_token,
-                   CreatePartitionTokenForQuery(*request, txn->id(),
-                                                /*empty_partition=*/true));
-  spanner_api::Partition empty_partition;
-  GOOGLESQL_ASSIGN_OR_RETURN(*empty_partition.mutable_partition_token(),
-                   PartitionTokenToString(empty_partition_token));
+    // Add two partitions to result set, with first partition being empty.
+    GOOGLESQL_ASSIGN_OR_RETURN(auto empty_partition_token,
+                     CreatePartitionTokenForQuery(*request, txn->id(),
+                                                  /*empty_partition=*/true));
+    spanner_api::Partition empty_partition;
+    GOOGLESQL_ASSIGN_OR_RETURN(*empty_partition.mutable_partition_token(),
+                     PartitionTokenToString(empty_partition_token));
 
-  // Second partition contains full result set for requested query.
-  GOOGLESQL_ASSIGN_OR_RETURN(auto full_partition_token,
-                   CreatePartitionTokenForQuery(*request, txn->id(),
-                                                /*empty_partition=*/false));
-  spanner_api::Partition full_partition;
-  GOOGLESQL_ASSIGN_OR_RETURN(*full_partition.mutable_partition_token(),
-                   PartitionTokenToString(full_partition_token));
+    // Second partition contains full result set for requested query.
+    GOOGLESQL_ASSIGN_OR_RETURN(auto full_partition_token,
+                     CreatePartitionTokenForQuery(*request, txn->id(),
+                                                  /*empty_partition=*/false));
+    spanner_api::Partition full_partition;
+    GOOGLESQL_ASSIGN_OR_RETURN(*full_partition.mutable_partition_token(),
+                     PartitionTokenToString(full_partition_token));
 
-  *response->mutable_partitions()->Add() = empty_partition;
-  *response->mutable_partitions()->Add() = full_partition;
+    *response->mutable_partitions()->Add() = empty_partition;
+    *response->mutable_partitions()->Add() = full_partition;
 
-  return absl::OkStatus();
+    return absl::OkStatus();
+  });
 }
 REGISTER_GRPC_HANDLER(Spanner, PartitionQuery);
 

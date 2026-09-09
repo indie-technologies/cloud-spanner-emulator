@@ -109,6 +109,8 @@ void Transaction::Close() {
   closed_ = true;
   if (type_ == kReadWrite || type_ == kPartitionedDml) {
     read_write()->Rollback().IgnoreError();
+  } else {
+    read_only()->Close();
   }
 }
 
@@ -156,7 +158,10 @@ bool Transaction::IsInvalid() const {
 
 bool Transaction::IsAborted() const {
   absl::MutexLock lock(mu_);
-  return type_ == kReadWrite && status_.code() == absl::StatusCode::kAborted;
+  return type_ != kPartitionedDml &&
+         (status_.code() == absl::StatusCode::kAborted ||
+          (type_ == kReadOnly &&
+           read_only()->status().code() == absl::StatusCode::kAborted));
 }
 
 bool Transaction::IsCommitted() const {
@@ -211,7 +216,9 @@ absl::StatusOr<backend::QueryResult> Transaction::ExecuteSql(
 
 absl::StatusOr<backend::QueryResult> Transaction::ExecuteSql(
     const backend::Query& query,
-    const v1::ExecuteSqlRequest_QueryMode query_mode) {
+    const v1::ExecuteSqlRequest_QueryMode query_mode,
+    backend::ChangeStreamQueryValidator::ChangeStreamMetadata*
+        change_stream_metadata) {
   mu_.AssertHeld();
   switch (type_) {
     case kReadOnly: {
@@ -221,7 +228,7 @@ absl::StatusOr<backend::QueryResult> Transaction::ExecuteSql(
                                 .reader = read_only(),
                                 .writer = nullptr,
                                 .is_read_only_txn = true},
-          query_mode);
+          query_mode, change_stream_metadata);
     }
     case kReadWrite: {
       return query_engine_->ExecuteSql(
@@ -233,7 +240,7 @@ absl::StatusOr<backend::QueryResult> Transaction::ExecuteSql(
                                     read_write()->commit_timestamp_tracker(),
                                 .allow_read_write_only_functions = true,
                                 .is_read_only_txn = false},
-          query_mode);
+          query_mode, change_stream_metadata);
     }
     case kPartitionedDml: {
       auto context = backend::QueryContext{
@@ -242,11 +249,16 @@ absl::StatusOr<backend::QueryResult> Transaction::ExecuteSql(
           .writer = read_write(),
           .commit_timestamp_tracker = read_write()->commit_timestamp_tracker(),
           .allow_read_write_only_functions = true,
-          .is_read_only_txn = false};
-      GOOGLESQL_RETURN_IF_ERROR(query_engine_->IsValidPartitionedDML(query, context));
+          .is_read_only_txn = false,
+          .is_partitioned_dml = true};
       // PartitionedDml will auto-commit transactions and cannot be reused.
       GOOGLESQL_ASSIGN_OR_RETURN(backend::QueryResult result,
-                       query_engine_->ExecuteSql(query, context, query_mode));
+                       query_engine_->ExecuteSql(query, context, query_mode,
+                                                 change_stream_metadata));
+      if (change_stream_metadata != nullptr &&
+          change_stream_metadata->is_change_stream_query) {
+        return result;
+      }
       GOOGLESQL_RETURN_IF_ERROR(read_write()->Commit());
       return result;
     }
@@ -302,7 +314,18 @@ absl::StatusOr<absl::Time> Transaction::GetCommitTimestamp() const {
 
 absl::Status Transaction::Status() const {
   mu_.AssertHeld();
+  return status_;
+}
 
+absl::Status Transaction::PrepareDml() {
+  mu_.AssertHeld();
+  GOOGLESQL_RETURN_IF_ERROR(status_);
+  // DML checks status after replaying previously completed sequence numbers.
+  // Acquire ownership here so replay does not start a new transaction, while
+  // new DML cannot resolve a schema or execute without the database lock.
+  if (type_ != kReadOnly && !IsCommitted() && !IsRolledback() && !IsInvalid()) {
+    return read_write()->EnsureActive();
+  }
   return status_;
 }
 
@@ -405,10 +428,15 @@ absl::Status Transaction::GuardedCall(OpType op,
     GOOGLESQL_RETURN_IF_ERROR(status_);
   }
 
-  // We only want to record the status for non-read operations, since read-only
-  // operations can never cause the transaction to be aborted and never repeat
-  // status errors. Non-DML SQL statements are read-only.
-  const absl::Status call_status = fn();
+  // Pin database ownership across schema resolution, query evaluation, and
+  // streaming. A competing transaction may abort an idle read-only transaction
+  // between requests, but must never change its view during a request.
+  const absl::Status call_status =
+      type_ == kReadOnly
+          ? read_only()->GuardedCall(fn)
+          : read_write()->GuardedRequest(
+                fn, op != OpType::kRollback && op != OpType::kDml &&
+                        !IsCommitted() && !IsRolledback() && !IsInvalid());
 
   if (!call_status.ok()) {
     if (op == OpType::kCommit || HasPayload(call_status, kConstraintError) ||

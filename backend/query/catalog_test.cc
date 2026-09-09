@@ -795,6 +795,65 @@ TEST_F(CatalogTest, FindTableWithSynonym) {
   EXPECT_EQ(queryable_mytable->wrapped_table(), queryable_syn->wrapped_table());
 }
 
+TEST_F(CatalogTest, EnumeratesTablesAndSynonymsBeforeLookup) {
+  MakeCatalog({
+      "CREATE SCHEMA ns",
+      "CREATE TABLE T (K INT64 NOT NULL) PRIMARY KEY (K)",
+      "ALTER TABLE T ADD SYNONYM ns.TAlias",
+      "CREATE TABLE ns.U (K INT64 NOT NULL) PRIMARY KEY (K)",
+      "ALTER TABLE ns.U ADD SYNONYM UAlias",
+  });
+
+  absl::flat_hash_set<const googlesql::Table*> root_tables;
+  GOOGLESQL_ASSERT_OK(catalog().GetTables(&root_tables));
+  EXPECT_THAT(root_tables, testing::UnorderedElementsAre(
+                               Property(&googlesql::Table::FullName, "T"),
+                               Property(&googlesql::Table::FullName, "UAlias")));
+
+  absl::flat_hash_set<const googlesql::Catalog*> catalogs;
+  GOOGLESQL_ASSERT_OK(catalog().GetCatalogs(&catalogs));
+  const QueryableNamedSchema* named = nullptr;
+  for (const auto* candidate : catalogs) {
+    if (candidate->FullName() == "ns") {
+      named = dynamic_cast<const QueryableNamedSchema*>(candidate);
+    }
+  }
+  ASSERT_NE(named, nullptr);
+  absl::flat_hash_set<const googlesql::Table*> named_tables;
+  GOOGLESQL_ASSERT_OK(named->GetTables(&named_tables));
+  EXPECT_THAT(named_tables,
+              testing::UnorderedElementsAre(
+                  Property(&googlesql::Table::FullName, "ns.U"),
+                  Property(&googlesql::Table::FullName, "ns.TAlias")));
+
+  const googlesql::Table* alias = nullptr;
+  GOOGLESQL_ASSERT_OK(catalog().FindTable({"NS", "talias"}, &alias));
+  EXPECT_THAT(named_tables, Contains(alias));
+  const googlesql::Table* again = nullptr;
+  GOOGLESQL_ASSERT_OK(catalog().FindTable({"ns", "TAlias"}, &again));
+  EXPECT_EQ(alias, again);
+}
+
+TEST_F(CatalogTest, ColumnExpressionsRetainTemporaryAnalyzerOptions) {
+  // MakeCatalog passes temporary analyzer options that are gone by the time
+  // these tables are looked up. Generated columns must also keep their
+  // expression-column bindings isolated from other tables.
+  MakeCatalog({
+      "CREATE TABLE T (K INT64 NOT NULL, V INT64 DEFAULT (7), "
+      "G INT64 AS (K + V) STORED) PRIMARY KEY (K)",
+      "CREATE TABLE U (K STRING(MAX) NOT NULL, "
+      "G INT64 AS (LENGTH(K)) STORED) PRIMARY KEY (K)",
+  });
+  const googlesql::Table* table = nullptr;
+  GOOGLESQL_ASSERT_OK(catalog().FindTable({"T"}, &table));
+  ASSERT_NE(table, nullptr);
+  EXPECT_TRUE(table->FindColumnByName("V")->HasDefaultExpression());
+  EXPECT_TRUE(table->FindColumnByName("G")->HasGeneratedExpression());
+  GOOGLESQL_ASSERT_OK(catalog().FindTable({"U"}, &table));
+  ASSERT_NE(table, nullptr);
+  EXPECT_TRUE(table->FindColumnByName("G")->HasGeneratedExpression());
+}
+
 TEST_F(CatalogTest, CatalogGettersWithNamedSchema) {
   test::ScopedEmulatorFeatureFlagsSetter flag_setter({
       .enable_user_defined_functions = true,

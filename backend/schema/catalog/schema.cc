@@ -738,6 +738,11 @@ Schema::Schema(const SchemaGraph* graph,
   locality_groups_.clear();
   locality_groups_map_.clear();
   for (const SchemaNode* node : graph_->GetSchemaNodes()) {
+    // Most graph nodes are columns or key columns. Neither belongs in these
+    // lookup maps, so avoid trying every catalog object type for each one.
+    if (node->As<Column>() != nullptr || node->As<KeyColumn>() != nullptr) {
+      continue;
+    }
     const View* view = node->As<const View>();
     if (view != nullptr) {
       views_.push_back(view);

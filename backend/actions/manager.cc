@@ -231,9 +231,10 @@ void ActionManager::AddActionsForSchema(const Schema* schema,
                                         const FunctionCatalog* function_catalog,
                                         googlesql::TypeFactory* type_factory) {
   absl::MutexLock l(mutex_);
+  registry_.reset();
   latest_schema_ = schema;
-  registry_ =
-      std::make_unique<ActionRegistry>(schema, function_catalog, type_factory);
+  function_catalog_ = function_catalog;
+  type_factory_ = type_factory;
 }
 
 absl::StatusOr<ActionRegistry*> ActionManager::GetActionsForSchema(
@@ -243,6 +244,10 @@ absl::StatusOr<ActionRegistry*> ActionManager::GetActionsForSchema(
     return error::Internal(
         absl::StrCat("Schema generation ", schema->generation(),
                      " was not registered with the Action Manager"));
+  }
+  if (registry_ == nullptr) {
+    registry_ = std::make_unique<ActionRegistry>(latest_schema_, function_catalog_,
+                                                type_factory_);
   }
   return registry_.get();
 }

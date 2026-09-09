@@ -45,6 +45,12 @@ SchemaNode* SchemaGraphEditor::MakeNewClone(const SchemaNode* node) {
 }
 
 absl::Status SchemaGraphEditor::InitCloneMap() {
+  // The map holds original-to-clone mappings and, during fixup, a visited
+  // entry for each clone or addition. Reserve once for both passes.
+  clone_map_.reserve(2 * original_graph_->GetSchemaNodes().size() +
+                     added_nodes_.size());
+  new_nodes_.reserve(num_original_nodes() + added_nodes_.size());
+
   // First, make a clone of the graph.
   GOOGLESQL_VLOG(2) << "First cloning pass";
   for (const auto* schema_node : original_graph_->GetSchemaNodes()) {
@@ -86,21 +92,23 @@ absl::StatusOr<const SchemaNode*> SchemaGraphEditor::Clone(
     return node;
   }
 
-  const SchemaNode* ret = nullptr;
-  NodeKind kind = GetNodeKind(node);
   const SchemaNode* clone = FindClone(node);
   if (clone != nullptr) {
     GOOGLESQL_VLOG(5) << std::string(depth_, ' ') << "Found already visited "
             << NodeKindString(clone) << " node :" << clone->DebugString();
-    ret = clone;
-  } else if (kind == kAdded || kind == kEdited || kind == kCloned) {
+    return clone;
+  }
+
+  // Added, edited and cloned nodes are fixed up in place. Only original
+  // nodes need a fresh clone. Avoid classifying every node with linear scans
+  // of the original and added node lists on this hot path.
+  if (!IsOriginalNode(node)) {
     SchemaNode* mutable_node = const_cast<SchemaNode*>(node);
     // When called with non-original nodes, clone_map_ acts as a 'visited' set.
     clone_map_[node] = node;
     GOOGLESQL_RETURN_IF_ERROR(FixupInternal(node, mutable_node));
-    ret = node;
+    return node;
   } else {
-    GOOGLESQL_RET_CHECK_EQ(kind, kOriginal);
     GOOGLESQL_RET_CHECK(!node->is_deleted());
     GOOGLESQL_VLOG(3) << std::string(depth_, ' ') << "Cloning " << NodeKindString(node)
             << " node: " << node->DebugString();
@@ -109,9 +117,8 @@ absl::StatusOr<const SchemaNode*> SchemaGraphEditor::Clone(
     GOOGLESQL_RETURN_IF_ERROR(FixupInternal(node, mutable_clone));
     GOOGLESQL_VLOG(3) << std::string(depth_, ' ')
             << "Finished cloning node: " << node->DebugString();
-    ret = mutable_clone;
+    return mutable_clone;
   }
-  return ret;
 }
 
 absl::Status SchemaGraphEditor::DeleteNode(const SchemaNode* node) {
@@ -133,12 +140,7 @@ absl::Status SchemaGraphEditor::AddNode(
 }
 
 bool SchemaGraphEditor::IsOriginalNode(const SchemaNode* node) const {
-  for (const auto* schema_node : original_graph_->GetSchemaNodes()) {
-    if (schema_node == node) {
-      return true;
-    }
-  }
-  return false;
+  return original_graph_->Contains(node);
 }
 
 absl::StatusOr<std::unique_ptr<SchemaGraph>>

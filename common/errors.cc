@@ -1860,7 +1860,7 @@ absl::Status AlteringParentColumn(absl::string_view column_name) {
 absl::Status ConcurrentSchemaChangeOrReadWriteTxnInProgress() {
   return absl::Status(absl::StatusCode::kFailedPrecondition,
                       "Schema change operation rejected because a concurrent "
-                      "schema change operation or read-write transaction is "
+                      "schema change operation or transaction is "
                       "already in progress.");
 }
 

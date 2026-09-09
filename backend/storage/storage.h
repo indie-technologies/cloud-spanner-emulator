@@ -33,14 +33,14 @@ namespace backend {
 
 // Storage defines the interface for a multi-version data store.
 //
-// There will be a Storage instance for each database created. The current
-// interface is grow-only, i.e. once data is added, it will not be deleted.
+// There will be a Storage instance for each database created.
 // Storage is thread-safe.
 class Storage {
  public:
   virtual ~Storage() {}
 
-  // Returns the column values for the given key at the specified timestamp.
+  // Returns current column values for the given key. Timestamps are retained
+  // for commit/backfill callers; they do not select historical versions.
   // Returns NOT_FOUND if the given key does not exist. For a given row if the
   // column value is not set, it returns an invalid googlesql::Value, i.e. one
   // for which is_valid() is false. Column values are always set in order of the
@@ -59,23 +59,21 @@ class Storage {
                             const std::vector<ColumnID>& column_ids,
                             std::unique_ptr<StorageIterator>* itr) const = 0;
 
-  // Writes column values for given key at the specified timestamp. Column value
-  // will be overwritten for non-unique <timestamp, table_id, key, column_id>
-  // combination.
+  // Writes current column values for the given key, replacing previous values.
   virtual absl::Status Write(absl::Time timestamp, const TableID& table_id,
                              const Key& key,
                              const std::vector<ColumnID>& column_ids,
                              const std::vector<googlesql::Value>& values) = 0;
 
-  // Marks the given key range as deleted at the specified timestamp. Column
-  // values at older timestamps are still accessible via Read and Lookup.
+  // Removes the given key range. Previous row values are not retained.
   // KeyRange interval should be in KeyRange::ClosedOpen format. Non ClosedOpen
   // ranges will result in INVALID_ARGUMENT.
   virtual absl::Status Delete(absl::Time timestamp, const TableID& table_id,
                               const KeyRange& key_range) = 0;
 
   // Sets the version retention period from the database options.
-  // This is used to determine when to delete expired data from storage.
+  // This determines when to reclaim dropped tables and columns. Row values
+  // themselves are not versioned.
   virtual void SetVersionRetentionPeriod(
       absl::Duration version_retention_period) = 0;
 

@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
@@ -573,6 +574,7 @@ cc_test(
         "//backend/database/change_stream:change_stream_partition_churner",
         "//backend/schema/updater:schema_updater",
         "//common:clock",
+        "//common:errors",
         "//frontend/converters:change_streams",
         "//frontend/converters:pg_change_streams",
         "//tests/common:change_streams",
@@ -613,5 +615,23 @@ cc_library(
         ":reads",
         ":sessions",
         ":transactions",
+    ],
+)
+
+cc_binary(
+    name = "performance_benchmark",
+    testonly = True,
+    srcs = ["performance_benchmark.cc"],
+    deps = [
+        "//backend/database",
+        "//backend/schema/updater:schema_updater",
+        "//common:clock",
+        "//tests/common:test_env",
+        "@com_github_google_benchmark//:benchmark",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_googleapis//google/spanner/v1:spanner_cc_proto",
+        "@com_google_googlesql//googlesql/base:status",
     ],
 )

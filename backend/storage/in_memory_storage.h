@@ -17,6 +17,11 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 
+#include <map>
+#include <vector>
+
+#include "absl/container/flat_hash_map.h"
+#include "absl/synchronization/mutex.h"
 #include "googlesql/public/value.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
@@ -31,11 +36,10 @@ namespace spanner {
 namespace emulator {
 namespace backend {
 
-// InMemoryStorage implements an in-memory multi-version data store.
-//
-// Keys are stored in sorted order. Value versions for a given column are also
-// sorted in order of the timestamp written. Keys are never deleted, but are
-// marked deleted for multi-version lookup.
+// InMemoryStorage holds only current values, with keys in sorted order.
+// Deletes physically remove rows. Timestamps remain in the Storage interface
+// for commit/backfill callers but do not select historical versions here.
+// The transaction layer must exclude writers for the entire read transaction.
 //
 // Lookup and Read return invalid googlesql::Value(s) for non-existent columns.
 //
@@ -79,22 +83,13 @@ class InMemoryStorage : public Storage {
       ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
-  using Cell = std::map<absl::Time, googlesql::Value>;
-  using Row = absl::flat_hash_map<ColumnID, Cell>;
+  using Row = absl::flat_hash_map<ColumnID, googlesql::Value>;
   using Table = std::map<Key, Row>;
   using Tables = absl::flat_hash_map<TableID, Table>;
 
-  // Returns true if the given row is valid at the specified timestamp.
-  bool Exists(const Row& row, absl::Time timestamp) const
+  // Returns an invalid value for an absent column.
+  googlesql::Value GetCellValue(const Row& row, const ColumnID& column_id) const
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
-  // Returns the value for given row and column_id at the specified timestamp.
-  googlesql::Value GetCellValueAtTimestamp(const Row& row,
-                                           const ColumnID& column_id,
-                                           absl::Time timestamp) const
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
-  void RemoveExpiredVersions(Cell& cell, absl::Time timestamp);
 
   mutable absl::Mutex mu_;
   Tables tables_ ABSL_GUARDED_BY(mu_);

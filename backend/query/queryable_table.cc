@@ -109,28 +109,30 @@ absl::StatusOr<std::unique_ptr<const googlesql::AnalyzerOutput>>
 QueryableTable::AnalyzeColumnExpression(
     const Column* column, googlesql::TypeFactory* type_factory,
     googlesql::Catalog* catalog,
-    std::optional<const googlesql::AnalyzerOptions> opt_options) const {
+    const googlesql::AnalyzerOptions* analyzer_options) const {
   std::unique_ptr<const googlesql::AnalyzerOutput> output = nullptr;
   bool enable_generated_pk =
       EmulatorFeatureFlags::instance().flags().enable_generated_pk;
   bool is_generated_column = enable_generated_pk && column->is_generated();
-  if (opt_options.has_value() &&
+  if (analyzer_options != nullptr &&
       (column->has_default_value() || (is_generated_column))) {
-    googlesql::AnalyzerOptions options = opt_options.value();
+    std::optional<googlesql::AnalyzerOptions> generated_options;
     if (is_generated_column) {
+      generated_options.emplace(*analyzer_options);
       for (const Column* dep : column->dependent_columns()) {
         GOOGLESQL_RETURN_IF_ERROR(
-            options.AddExpressionColumn(dep->Name(), dep->GetType()))
+            generated_options->AddExpressionColumn(dep->Name(), dep->GetType()))
             << "Failed to add dependent column " << dep->Name()
             << " for generated column : " << column->FullName();
       }
+      analyzer_options = &*generated_options;
     }
     std::string expression_type = "default";
     if (is_generated_column) {
       expression_type = "generated";
     }
     GOOGLESQL_RETURN_IF_ERROR(googlesql::AnalyzeExpressionForAssignmentToType(
-        column->expression().value(), options, catalog, type_factory,
+        column->expression().value(), *analyzer_options, catalog, type_factory,
         column->GetType(), &output))
         << "Failed to analyze " << expression_type << " expression for column "
         << column->FullName();
@@ -140,16 +142,17 @@ QueryableTable::AnalyzeColumnExpression(
 
 QueryableTable::QueryableTable(
     const backend::Table* table, RowReader* reader,
-    std::optional<const googlesql::AnalyzerOptions> opt_options,
+    const googlesql::AnalyzerOptions* options,
     googlesql::Catalog* catalog, googlesql::TypeFactory* type_factory,
     bool is_synonym)
     : is_synonym_(is_synonym), wrapped_table_(table), reader_(reader) {
   bool enable_generated_pk =
       EmulatorFeatureFlags::instance().flags().enable_generated_pk;
+  columns_.reserve(table->columns().size());
   for (const auto* column : table->columns()) {
     absl::StatusOr<std::unique_ptr<const googlesql::AnalyzerOutput>>
         analyzer_output =
-            AnalyzeColumnExpression(column, type_factory, catalog, opt_options);
+            AnalyzeColumnExpression(column, type_factory, catalog, options);
     ABSL_CHECK_OK(analyzer_output.status());  // Crash OK
     std::unique_ptr<const googlesql::AnalyzerOutput> output =
         std::move(analyzer_output.value());
@@ -175,6 +178,7 @@ QueryableTable::QueryableTable(
   }
 
   // Populate primary_key_column_indexes_.
+  primary_key_column_indexes_.reserve(table->primary_key().size());
   for (const auto& key_column : table->primary_key()) {
     for (int i = 0; i < wrapped_table_->columns().size(); ++i) {
       if (key_column->column() == wrapped_table_->columns()[i]) {
@@ -191,6 +195,7 @@ QueryableTable::CreateEvaluatorTableIterator(
   GOOGLESQL_RET_CHECK_NE(reader_, nullptr);
 
   std::vector<std::string> column_names;
+  column_names.reserve(column_idxs.size());
   for (int idx : column_idxs) {
     column_names.push_back(GetColumn(idx)->Name());
   }

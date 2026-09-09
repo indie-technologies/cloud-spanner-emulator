@@ -29,6 +29,7 @@
 #include "googlesql/public/property_graph.h"
 #include "googlesql/public/types/type.h"
 #include "googlesql/public/types/type_factory.h"
+#include "absl/base/call_once.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -137,6 +138,14 @@ class Catalog : public googlesql::EnumerableCatalog {
 
   absl::Status PopulateSystemProcedureMap();
 
+  // Creates table wrappers on demand and preserves their identity for this
+  // catalog's lifetime. Names may be qualified or refer to a synonym.
+  const QueryableTable* FindOrCreateTable(const std::string& name) const;
+
+  // Types can be collected from schema columns without analyzing expressions
+  // or constructing table wrappers.
+  void InitializeTypes() const;
+
   // Returns the information schema catalog (creating one if needed).
   googlesql::Catalog* GetInformationSchemaCatalog() const
       ABSL_LOCKS_EXCLUDED(mu_);
@@ -177,8 +186,16 @@ class Catalog : public googlesql::EnumerableCatalog {
   // The backend schema (which is the default schema in this catalog).
   const Schema* schema_ = nullptr;
 
-  // Tables available in the default schema.
-  CaseInsensitiveStringMap<std::unique_ptr<const QueryableTable>> tables_;
+  // Lazy table construction can outlive the caller's options, including the
+  // default temporary argument. Keep one owned copy per request catalog.
+  const googlesql::AnalyzerOptions analyzer_options_;
+  RowReader* reader_ = nullptr;
+  const ChangeStream* internal_change_stream_ = nullptr;
+
+  // Wrappers already requested, keyed by qualified table/synonym name.
+  mutable absl::Mutex tables_mu_;
+  mutable CaseInsensitiveStringMap<std::unique_ptr<const QueryableTable>> tables_
+      ABSL_GUARDED_BY(tables_mu_);
   CaseInsensitiveStringMap<std::unique_ptr<const QueryableView>> views_;
   CaseInsensitiveStringMap<std::unique_ptr<const QueryableModel>> models_;
 
@@ -187,7 +204,8 @@ class Catalog : public googlesql::EnumerableCatalog {
       property_graphs_;
 
   // Types available in the default schema.
-  CaseInsensitiveStringMap<const googlesql::Type*> types_;
+  mutable absl::once_flag types_once_;
+  mutable CaseInsensitiveStringMap<const googlesql::Type*> types_;
 
   // Change Stream TVFs available in the default schema.
   CaseInsensitiveStringMap<

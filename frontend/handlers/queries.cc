@@ -265,7 +265,7 @@ absl::Status ExecuteSql(RequestContext* ctx,
           // DML needs to explicitly check the transaction status since
           // the DML sequence number replay should take priority over returning
           // a previously encountered error status.
-          GOOGLESQL_RETURN_IF_ERROR(txn->Status());
+          GOOGLESQL_RETURN_IF_ERROR(txn->PrepareDml());
         }
 
         // Cannot query after commit, rollback, or non-recoverable error.
@@ -445,7 +445,7 @@ absl::Status ExecuteStreamingSql(
           // DML needs to explicitly check the transaction status since
           // the DML sequence number replay should take priority over returning
           // a previously encountered error status.
-          GOOGLESQL_RETURN_IF_ERROR(txn->Status());
+          GOOGLESQL_RETURN_IF_ERROR(txn->PrepareDml());
         }
 
         // Cannot query after commit, rollback, or non-recoverable error.
@@ -474,16 +474,8 @@ absl::Status ExecuteStreamingSql(
                 txn->query_engine()->type_factory(),
                 txn->schema()->proto_bundle(),
                 request->request_options().client_context().secure_context()));
-        bool in_read_write_txn = txn->IsReadWrite() || txn->IsPartitionedDml();
-        GOOGLESQL_ASSIGN_OR_RETURN(change_stream_metadata,
-                         backend::QueryEngine::TryGetChangeStreamMetadata(
-                             query, txn->schema(), in_read_write_txn));
-        // if current query is a change stream query, return and exit current
-        // transaction lambda to avoid nested transaction call.
-        if (change_stream_metadata.is_change_stream_query) {
-          return absl::OkStatus();
-        }
-        auto maybe_result = txn->ExecuteSql(query, request->query_mode());
+        auto maybe_result =
+            txn->ExecuteSql(query, request->query_mode(), &change_stream_metadata);
         if (!maybe_result.ok()) {
           absl::Status error = maybe_result.status();
           if (txn->IsPartitionedDml()) {
@@ -498,6 +490,9 @@ absl::Status ExecuteStreamingSql(
             txn->Rollback().IgnoreError();
           }
           return error;
+        }
+        if (change_stream_metadata.is_change_stream_query) {
+          return absl::OkStatus();
         }
         backend::QueryResult& result = maybe_result.value();
 
@@ -577,6 +572,10 @@ absl::Status ExecuteStreamingSql(
         return absl::OkStatus();
       });
   if (change_stream_metadata.is_change_stream_query) {
+    GOOGLESQL_RETURN_IF_ERROR(status);
+    // Change streams use a series of short strong reads. Release the metadata
+    // transaction before waiting for new records or starting those reads.
+    txn->Close();
     ChangeStreamsHandler change_streams_handler{change_stream_metadata};
     return change_streams_handler.ExecuteChangeStreamQuery(request, stream,
                                                            session);
@@ -638,7 +637,7 @@ absl::Status ExecuteBatchDml(RequestContext* ctx,
     // DML needs to explicitly check the transaction status since
     // the DML sequence number replay should take priority over returning
     // a previously encountered error status.
-    GOOGLESQL_RETURN_IF_ERROR(txn->Status());
+    GOOGLESQL_RETURN_IF_ERROR(txn->PrepareDml());
 
     // Cannot query after commit, rollback, or non-recoverable error.
     if (txn->IsInvalid()) {

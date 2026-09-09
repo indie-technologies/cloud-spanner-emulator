@@ -1361,7 +1361,17 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteInsertOnConflictDml(
 
 absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
     const Query& query, const QueryContext& context,
-    v1::ExecuteSqlRequest_QueryMode query_mode) const {
+    v1::ExecuteSqlRequest_QueryMode query_mode,
+    ChangeStreamQueryValidator::ChangeStreamMetadata*
+        change_stream_metadata) const {
+  if (change_stream_metadata != nullptr) {
+    *change_stream_metadata = {};
+  }
+  const bool is_dml = IsDMLQuery(query.sql);
+  if (context.is_partitioned_dml && !is_dml &&
+      change_stream_metadata == nullptr) {
+    return error::InvalidOperationUsingPartitionedDmlTransaction();
+  }
   absl::Time start_time = absl::Now();
 
   Query normalized_query;
@@ -1370,7 +1380,9 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
                    MakeAnalyzerOptionsWithParameters(
                        normalized_query.declared_params,
                        GetTimeZone(function_catalog_.GetLatestSchema())));
-  analyzer_options.set_prune_unused_columns(true);
+  // DML needs every target column. Analyze it without pruning from the start
+  // instead of analyzing, validating, and cloning the same statement twice.
+  analyzer_options.set_prune_unused_columns(!is_dml);
 
   QueryEvaluatorForEngine view_evaluator(*this, context,
                                          normalized_query.secure_context);
@@ -1393,7 +1405,8 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
                      Analyze(normalized_query.sql, catalog.get(),
                              analyzer_options, type_factory_));
 
-    if (analyzer_output->has_graph_references()) {
+    if (analyzer_output->has_graph_references() &&
+        analyzer_options.prune_unused_columns()) {
       analyzer_options.set_prune_unused_columns(false);
       catalog = std::make_unique<Catalog>(
           context.schema, &function_catalog_, type_factory_, analyzer_options,
@@ -1410,11 +1423,11 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
 
   GOOGLESQL_ASSIGN_OR_RETURN(auto resolved_statement,
                    ExtractValidatedResolvedStatementAndOptions(
-                       analyzer_output.get(), context, catalog.get()));
+                       analyzer_output.get(), context, catalog.get(),
+                       /*in_partition_query=*/context.is_partitioned_dml));
 
-  // Change stream queries are not directly executed via this generic ExecuteSql
-  // function in query engine. If a change stream query reaches here, it is from
-  // an incorrect API(only ExecuteStreamingSql is allowed).
+  // Reuse this request's analysis for streaming change-stream detection. The
+  // frontend dispatches a validated change stream after releasing ownership.
   ChangeStreamQueryValidator validator{
       context.schema, start_time,
       absl::flat_hash_map<std::string, googlesql::Value>(params.begin(),
@@ -1422,7 +1435,21 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
   GOOGLESQL_ASSIGN_OR_RETURN(auto is_change_stream,
                    validator.IsChangeStreamQuery(resolved_statement.get()));
   if (is_change_stream) {
-    return error::ChangeStreamQueriesMustBeStreaming();
+    if (change_stream_metadata == nullptr) {
+      return error::ChangeStreamQueriesMustBeStreaming();
+    }
+    GOOGLESQL_RETURN_IF_ERROR(resolved_statement->Accept(&validator));
+    *change_stream_metadata = validator.change_stream_metadata();
+    return QueryResult{};
+  }
+
+  if (context.is_partitioned_dml) {
+    if (!is_dml) {
+      return error::InvalidOperationUsingPartitionedDmlTransaction();
+    }
+    PartitionedDMLValidator partitioned_dml_validator;
+    GOOGLESQL_RETURN_IF_ERROR(
+        resolved_statement->Accept(&partitioned_dml_validator));
   }
 
   QueryResult result;
@@ -1435,21 +1462,26 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
     result.rows = std::move(cursor);
   } else {
     GOOGLESQL_RET_CHECK_NE(context.writer, nullptr);
-    analyzer_options.set_prune_unused_columns(false);
-    if (context.schema->dialect() ==
-        database_api::DatabaseDialect::POSTGRESQL) {
-      GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
-                       AnalyzePostgreSQL(normalized_query.sql, catalog.get(),
-                                         analyzer_options, type_factory_,
-                                         &function_catalog_));
-    } else {
-      GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
-                       Analyze(normalized_query.sql, catalog.get(),
-                               analyzer_options, type_factory_));
+    // Keep a fallback for dialect statements the lightweight classifier does
+    // not recognize as DML.
+    if (analyzer_options.prune_unused_columns()) {
+      analyzer_options.set_prune_unused_columns(false);
+      if (context.schema->dialect() ==
+          database_api::DatabaseDialect::POSTGRESQL) {
+        GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
+                         AnalyzePostgreSQL(normalized_query.sql, catalog.get(),
+                                           analyzer_options, type_factory_,
+                                           &function_catalog_));
+      } else {
+        GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
+                         Analyze(normalized_query.sql, catalog.get(),
+                                 analyzer_options, type_factory_));
+      }
+      GOOGLESQL_ASSIGN_OR_RETURN(resolved_statement,
+                       ExtractValidatedResolvedStatementAndOptions(
+                           analyzer_output.get(), context, catalog.get(),
+                           /*in_partition_query=*/context.is_partitioned_dml));
     }
-    GOOGLESQL_ASSIGN_OR_RETURN(resolved_statement,
-                     ExtractValidatedResolvedStatementAndOptions(
-                         analyzer_output.get(), context, catalog.get()));
 
     // Only execute the SQL statement if the user did not request PLAN mode.
     if (query_mode != v1::ExecuteSqlRequest::PLAN) {

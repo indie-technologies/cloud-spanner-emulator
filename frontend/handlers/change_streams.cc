@@ -28,6 +28,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/substitute.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "backend/access/read.h"
 #include "backend/query/change_stream/change_stream_query_validator.h"
@@ -38,7 +39,6 @@
 #include "common/errors.h"
 #include "frontend/converters/change_streams.h"
 #include "frontend/converters/pg_change_streams.h"
-#include "frontend/converters/time.h"
 #include "frontend/entities/session.h"
 #include "frontend/entities/transaction.h"
 #include "frontend/server/handler.h"
@@ -88,22 +88,32 @@ absl::Status VerifyChangeStreamExistence(const std::string& change_stream_name,
   return error::ChangeStreamNotFound(change_stream_name);
 }
 
+// Change-stream history is stored as ordinary rows. Wait for the requested
+// interval before taking ownership, then scan those rows using a strong read.
+// Holding the database while waiting would prevent new change records committing.
+absl::StatusOr<std::unique_ptr<Transaction>> CreateChangeStreamRead(
+    const std::shared_ptr<Session>& session, absl::Time earliest_read) {
+  absl::SleepFor(earliest_read - Clock().Now());
+  spanner_api::TransactionOptions options;
+  options.mutable_read_only()->set_strong(true);
+  return session->CreateSingleUseTransaction(options);
+}
+
 absl::StatusOr<absl::Duration> TryGetChangeStreamRetentionPeriod(
     const std::string& change_stream_name, std::shared_ptr<Session> session,
     absl::Time read_ts) {
-  spanner_api::TransactionOptions txn_options;
-  txn_options.mutable_read_only()->set_return_read_timestamp(false);
-  // If the user provided tvf start time is past now, wait until this future
-  // time to perform a read on partition token end time.
-  GOOGLESQL_ASSIGN_OR_RETURN(
-      *txn_options.mutable_read_only()->mutable_min_read_timestamp(),
-      TimestampToProto(read_ts));
-  GOOGLESQL_ASSIGN_OR_RETURN(auto txn, session->CreateSingleUseTransaction(txn_options));
-  auto change_stream = txn->schema()->FindChangeStream(change_stream_name);
-  if (change_stream != nullptr) {
-    return absl::Seconds(change_stream->parsed_retention_period());
-  }
-  return error::ChangeStreamNotFound(change_stream_name);
+  GOOGLESQL_ASSIGN_OR_RETURN(auto txn, CreateChangeStreamRead(session, read_ts));
+  absl::Duration retention;
+  GOOGLESQL_RETURN_IF_ERROR(txn->GuardedCall(
+      Transaction::OpType::kRead, [&]() -> absl::Status {
+        auto change_stream = txn->schema()->FindChangeStream(change_stream_name);
+        if (change_stream == nullptr) {
+          return error::ChangeStreamNotFound(change_stream_name);
+        }
+        retention = absl::Seconds(change_stream->parsed_retention_period());
+        return absl::OkStatus();
+      }));
+  return retention;
 }
 
 bool IsQueryResultEmpty(backend::QueryResult& result) {
@@ -188,12 +198,8 @@ absl::Status ChangeStreamsHandler::ProcessDataChangeRecordsAndStreamBack(
 absl::Status ChangeStreamsHandler::ExecuteInitialQuery(
     std::shared_ptr<Session> session,
     ServerStream<spanner_api::PartialResultSet>* stream) {
-  spanner_api::TransactionOptions txn_options;
   GOOGLESQL_ASSIGN_OR_RETURN(
-      *txn_options.mutable_read_only()->mutable_min_read_timestamp(),
-      TimestampToProto(metadata().start_timestamp));
-  txn_options.mutable_read_only()->set_return_read_timestamp(false);
-  GOOGLESQL_ASSIGN_OR_RETURN(auto txn, session->CreateSingleUseTransaction(txn_options));
+      auto txn, CreateChangeStreamRead(session, metadata().start_timestamp));
   return txn->GuardedCall(Transaction::OpType::kSql, [&]() -> absl::Status {
     GOOGLESQL_RETURN_IF_ERROR(VerifyChangeStreamExistence(metadata().change_stream_name,
                                                 txn->schema()));
@@ -243,13 +249,7 @@ absl::Status ChangeStreamsHandler::ExecuteInitialQuery(
 absl::StatusOr<absl::Time> ChangeStreamsHandler::TryGetPartitionTokenEndTime(
     std::shared_ptr<Session> session, absl::Time read_ts) const {
   absl::Time start, end;
-  spanner_api::TransactionOptions txn_options;
-  txn_options.mutable_read_only()->set_return_read_timestamp(false);
-  // If the user provided tvf start time is past now, wait until this future
-  // time to perform a read on partition token end time.
-  GOOGLESQL_ASSIGN_OR_RETURN(*txn_options.mutable_read_only()->mutable_read_timestamp(),
-                   TimestampToProto(read_ts));
-  GOOGLESQL_ASSIGN_OR_RETURN(auto txn, session->CreateSingleUseTransaction(txn_options));
+  GOOGLESQL_ASSIGN_OR_RETURN(auto txn, CreateChangeStreamRead(session, read_ts));
   GOOGLESQL_RETURN_IF_ERROR(
       txn->GuardedCall(Transaction::OpType::kSql, [&]() -> absl::Status {
         backend::Query get_partition_token_time_query =
@@ -360,24 +360,21 @@ absl::Status ChangeStreamsHandler::ExecutePartitionQuery(
   // query's lifetime.
   bool expect_metadata = true;
   while (current_start <= tvf_end && current_start < partition_token_end_time) {
-    // For historical queries where tvf end is in the past, set the read
-    // transaction snapshot time to now to prevent >1h stale read, which is now
-    // allowed.
-    absl::Time current_txn_snapshot_time = std::max(current_end, now);
+    // Wait until this interval is complete before scanning its change records.
+    absl::Time earliest_read = std::max(current_end, now);
     // Get the newest retention period so most up to date retention will apply
     // to curent running query.
     GOOGLESQL_ASSIGN_OR_RETURN(
         absl::Duration current_retention,
         TryGetChangeStreamRetentionPeriod(metadata().change_stream_name,
-                                          session, current_txn_snapshot_time));
-    spanner_api::TransactionOptions txn_options;
+                                          session, earliest_read));
     // If the partition token hasn't been churned yet, we re-scan the partition
     // table to see if the end time has been churned and update the partition
     // end time.
     if (partition_token_end_time == absl::InfiniteFuture()) {
       GOOGLESQL_ASSIGN_OR_RETURN(
           partition_token_end_time,
-          TryGetPartitionTokenEndTime(session, current_txn_snapshot_time));
+          TryGetPartitionTokenEndTime(session, earliest_read));
     }
     GOOGLESQL_RETURN_IF_ERROR(ValidateTokenInRetentionWindow(
         metadata().start_timestamp, current_start, partition_token_end_time,
@@ -387,11 +384,8 @@ absl::Status ChangeStreamsHandler::ExecutePartitionQuery(
     const absl::Time scan_end = std::min(partition_token_end_time, current_end);
     const bool expect_heartbeat =
         current_end - last_record_time >= heartbeat_interval;
-    // This transaction will be blocked until now passes current_end.
-    GOOGLESQL_ASSIGN_OR_RETURN(*txn_options.mutable_read_only()->mutable_read_timestamp(),
-                     TimestampToProto(current_txn_snapshot_time));
     GOOGLESQL_ASSIGN_OR_RETURN(auto txn,
-                     session->CreateSingleUseTransaction(txn_options));
+                     CreateChangeStreamRead(session, earliest_read));
     absl::Status status =
         txn->GuardedCall(Transaction::OpType::kSql, [&]() -> absl::Status {
           if (mutable_key_range) {

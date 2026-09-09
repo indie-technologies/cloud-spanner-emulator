@@ -2327,6 +2327,34 @@ TEST_P(QueryEngineTest, InsertOnConflictDoUpdateNamedSchema) {
   }
 }
 
+TEST_P(QueryEngineTest, PartitionedDmlValidatesBeforeWriting) {
+  MockRowWriter writer;
+  EXPECT_CALL(writer, Write(testing::_)).Times(0);
+  QueryContext context{schema(), reader(), &writer};
+  context.is_partitioned_dml = true;
+  for (const std::string& sql : {
+           "INSERT INTO test_table (int64_col) VALUES (10)",
+           "UPDATE test_table SET string_col = "
+           "(SELECT MAX(string_col) FROM test_table) WHERE int64_col = 1"}) {
+    EXPECT_THAT(query_engine().ExecuteSql(Query{sql}, context),
+                StatusIs(StatusCode::kInvalidArgument));
+  }
+}
+
+TEST_P(QueryEngineTest, PartitionedDmlExecutesValidatedUpdate) {
+  MockRowWriter writer;
+  EXPECT_CALL(writer, Write(testing::_))
+      .WillOnce(Return(absl::OkStatus()));
+  QueryContext context{schema(), reader(), &writer};
+  context.is_partitioned_dml = true;
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto result,
+      query_engine().ExecuteSql(
+          Query{"UPDATE test_table SET string_col = 'updated' "
+                "WHERE int64_col = 1"}, context));
+  EXPECT_EQ(result.modified_row_count, 1);
+}
+
 TEST_P(QueryEngineTest, TestGetValidChangeStreamMetadataFromChangeStreamQuery) {
   Query query;
   absl::Time start_time = absl::Now();
@@ -2350,6 +2378,20 @@ TEST_P(QueryEngineTest, TestGetValidChangeStreamMetadataFromChangeStreamQuery) {
 
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto metadata, query_engine().TryGetChangeStreamMetadata(
                                           query, change_stream_schema()));
+  ChangeStreamQueryValidator::ChangeStreamMetadata streaming_metadata;
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto result,
+      query_engine().ExecuteSql(
+          query, QueryContext{change_stream_schema(), reader()},
+          v1::ExecuteSqlRequest::NORMAL, &streaming_metadata));
+  EXPECT_EQ(result.rows, nullptr);
+  EXPECT_EQ(streaming_metadata.change_stream_name, metadata.change_stream_name);
+  EXPECT_EQ(streaming_metadata.start_timestamp, metadata.start_timestamp);
+  EXPECT_EQ(streaming_metadata.end_timestamp, metadata.end_timestamp);
+  EXPECT_EQ(streaming_metadata.partition_token, metadata.partition_token);
+  EXPECT_EQ(streaming_metadata.heartbeat_milliseconds,
+            metadata.heartbeat_milliseconds);
+  EXPECT_TRUE(streaming_metadata.is_change_stream_query);
   EXPECT_EQ(metadata.change_stream_name, "change_stream_test_table");
   EXPECT_EQ(metadata.heartbeat_milliseconds, 1000);
   EXPECT_EQ(metadata.partition_token.value(), "test_token");
@@ -2401,6 +2443,22 @@ TEST_P(QueryEngineTest, TestGetEmptyChangeStreamMetadataFromNormalQuery) {
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto metadata, query_engine().TryGetChangeStreamMetadata(
                                           query, change_stream_schema()));
   ASSERT_FALSE(metadata.is_change_stream_query);
+}
+
+TEST_P(QueryEngineTest, StreamingExecutionClearsMetadataForRegularQueries) {
+  ChangeStreamQueryValidator::ChangeStreamMetadata metadata;
+  metadata.is_change_stream_query = true;
+  metadata.change_stream_name = "previous_stream";
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto result,
+      query_engine().ExecuteSql(Query{"SELECT 1"}, QueryContext{schema(), reader()},
+                                v1::ExecuteSqlRequest::NORMAL, &metadata));
+  EXPECT_FALSE(metadata.is_change_stream_query);
+  EXPECT_TRUE(metadata.change_stream_name.empty());
+  ASSERT_NE(result.rows, nullptr);
+  EXPECT_TRUE(result.rows->Next());
+  EXPECT_EQ(result.rows->ColumnValue(0), Int64(1));
+  EXPECT_FALSE(result.rows->Next());
 }
 
 TEST_P(QueryEngineTest,

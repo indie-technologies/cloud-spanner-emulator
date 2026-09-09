@@ -254,7 +254,28 @@ ReadWriteTransaction::ReadWriteTransaction(
           std::make_unique<TransactionReadOnlyStore>(transaction_store_.get()),
           std::make_unique<TransactionEffectsBuffer>(&write_ops_queue_),
           clock)),
-      schema_(versioned_catalog_->GetLatestSchema()) {}
+      schema_(nullptr) {}
+
+ReadWriteTransaction::~ReadWriteTransaction() {
+  // Detach the abort callback from the manager before destroying transaction
+  // state. Uncommitted writes remain private to transaction_store_.
+  lock_handle_->UnlockAll();
+}
+
+absl::Status ReadWriteTransaction::GuardedRequest(
+    const std::function<absl::Status()>& fn, bool acquire_lock) {
+  absl::MutexLock request_lock(request_mu_);
+  // Validate ownership even for requests such as SELECT 1 that never call a
+  // storage method. The frontend handles replay and terminal-state errors.
+  if (acquire_lock) {
+    GOOGLESQL_RETURN_IF_ERROR(EnsureActive());
+  }
+  return fn();
+}
+
+absl::Status ReadWriteTransaction::EnsureActive() {
+  return GuardedCall(OpType::kRead, [] { return absl::OkStatus(); });
+}
 
 absl::StatusOr<absl::Time> ReadWriteTransaction::GetCommitTimestamp() {
   absl::MutexLock lock(mu_);
@@ -325,6 +346,9 @@ void ReadWriteTransaction::Reset() {
   transaction_store_->Clear();
   std::queue<WriteOp> empty;
   write_ops_queue_.swap(empty);
+  action_registry_ = nullptr;
+  schema_ = nullptr;
+  schema_snapshot_.reset();
   state_ = State::kUninitialized;
 }
 
@@ -354,15 +378,18 @@ absl::Status ReadWriteTransaction::GuardedCall(
       break;
     }
     case State::kUninitialized: {
-      schema_ = versioned_catalog_->GetLatestSchema();
-      auto maybe_action_registry =
-          action_manager_->GetActionsForSchema(schema_);
-      if (!maybe_action_registry.ok()) {
-        Reset();
-        ++retry_state_.abort_retry_count;
-        return error::AbortDueToConcurrentSchemaChange(id_);
+      if (op != OpType::kRollback && op != OpType::kInvalidate) {
+        lock_handle_->EnqueueLock(
+            LockRequest(LockMode::kExclusive, "", KeyRange::All(), {}));
+        const absl::Status lock_status = lock_handle_->Wait();
+        if (!lock_status.ok()) {
+          Reset();
+          ++retry_state_.abort_retry_count;
+          return lock_status;
+        }
       }
-      action_registry_ = maybe_action_registry.value();
+      schema_snapshot_ = versioned_catalog_->GetLatestSchemaSnapshot();
+      schema_ = schema_snapshot_.get();
       state_ = State::kActive;
       break;
     }
@@ -374,6 +401,18 @@ absl::Status ReadWriteTransaction::GuardedCall(
       }
       break;
     }
+  }
+
+  // Reads, including a read-write transaction committed without writes, do not
+  // need write validators or their query catalog.
+  if (op == OpType::kWrite && action_registry_ == nullptr) {
+    auto registry = action_manager_->GetActionsForSchema(schema_);
+    if (!registry.ok()) {
+      Reset();
+      ++retry_state_.abort_retry_count;
+      return error::AbortDueToConcurrentSchemaChange(id_);
+    }
+    action_registry_ = *registry;
   }
 
   absl::Status status = fn();
@@ -420,9 +459,14 @@ absl::Status ReadWriteTransaction::ProcessWriteOps(
 
 absl::Status ReadWriteTransaction::ProcessChangeStreamWriteOps() {
   mu_.AssertHeld();
+  // Avoid copying every buffered mutation and building tracking maps for the
+  // common case of a database without change streams.
+  if (schema_->change_streams().empty()) return absl::OkStatus();
+  auto buffered_ops = transaction_store_->GetBufferedOps();
+  if (buffered_ops.empty()) return absl::OkStatus();
   GOOGLESQL_ASSIGN_OR_RETURN(
       auto write_ops,
-      BuildChangeStreamWriteOps(schema_, transaction_store_->GetBufferedOps(),
+      BuildChangeStreamWriteOps(schema_, std::move(buffered_ops),
                                 action_context_->store(), id_,
                                 options_.exclude_txn_from_change_streams));
   for (const WriteOp& writeop : write_ops) {
@@ -660,12 +704,17 @@ absl::Status ReadWriteTransaction::Rollback() {
 }
 
 absl::Status ReadWriteTransaction::TryAbort() {
+  if (!request_mu_.try_lock()) {
+    return error::CouldNotObtainTransactionMutex(id());
+  }
   if (!mu_.try_lock()) {
+    request_mu_.unlock();
     return error::CouldNotObtainTransactionMutex(id());
   }
 
   if (state_ != State::kActive) {
     mu_.unlock();
+    request_mu_.unlock();
     return error::TransactionClosed(id());
   }
 
@@ -678,6 +727,7 @@ absl::Status ReadWriteTransaction::TryAbort() {
   state_ = State::kAborted;
 
   mu_.unlock();
+  request_mu_.unlock();
   return absl::OkStatus();
 }
 

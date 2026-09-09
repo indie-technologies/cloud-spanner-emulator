@@ -16,145 +16,183 @@
 
 #include "backend/transaction/read_only_transaction.h"
 
-#include <ctime>
+#include <memory>
+#include <thread>
 
-#include "googlesql/public/type.h"
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
-#include "tests/common/proto_matchers.h"
 #include "absl/status/status.h"
-#include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "backend/common/ids.h"
-#include "backend/schema/catalog/schema.h"
+#include "backend/datamodel/key_range.h"
+#include "backend/locking/manager.h"
 #include "backend/schema/catalog/versioned_catalog.h"
 #include "backend/storage/in_memory_storage.h"
 #include "backend/transaction/options.h"
 #include "common/clock.h"
-#include "tests/common/schema_constructor.h"
 
-namespace google {
-namespace spanner {
-namespace emulator {
-namespace backend {
+namespace google::spanner::emulator::backend {
 namespace {
+
+using googlesql_base::testing::StatusIs;
 
 class ReadOnlyTransactionTest : public testing::Test {
  protected:
-  TransactionID txn_id_ = 1;
+  std::unique_ptr<ReadOnlyTransaction> Reader(ReadOnlyOptions options = {}) {
+    return std::make_unique<ReadOnlyTransaction>(
+        options, next_id_++, &clock_, &storage_, &manager_, &catalog_);
+  }
+  std::unique_ptr<LockHandle> Writer() {
+    return manager_.CreateHandle(next_id_++, nullptr, 1);
+  }
+  void Acquire(LockHandle* handle) {
+    handle->EnqueueLock(LockRequest(LockMode::kExclusive, "", KeyRange::All(), {}));
+  }
+
   Clock clock_;
-  absl::Time t0_ = clock_.Now();
   InMemoryStorage storage_;
-  LockManager lock_manager_ = LockManager(&clock_);
-  VersionedCatalog versioned_catalog_;
-  absl::Time read_timestamp_;
+  LockManager manager_{&clock_};
+  VersionedCatalog catalog_;
+  TransactionID next_id_ = 1;
 };
 
-TEST_F(ReadOnlyTransactionTest, StongSnapshotReadTimestamp) {
-  ReadOnlyOptions opts;
-  opts.bound = TimestampBound::kStrongRead;
-
-  ReadOnlyTransaction txn(opts, txn_id_, &clock_, &storage_, &lock_manager_,
-                          &versioned_catalog_);
-  read_timestamp_ = txn.read_timestamp();
-  EXPECT_GT(clock_.Now(), read_timestamp_);
+TEST_F(ReadOnlyTransactionTest, StrongReadPinsCurrentSchemaAndTimestamp) {
+  const auto before = clock_.Now();
+  auto reader = Reader();
+  GOOGLESQL_ASSERT_OK(reader->status());
+  EXPECT_GE(reader->read_timestamp(), before);
+  EXPECT_LE(reader->read_timestamp(), clock_.Now());
+  EXPECT_EQ(reader->schema(), catalog_.GetLatestSchema());
+  const auto timestamp = reader->read_timestamp();
+  GOOGLESQL_EXPECT_OK(reader->GuardedCall([] { return absl::OkStatus(); }));
+  EXPECT_EQ(reader->read_timestamp(), timestamp);
 }
 
-TEST_F(ReadOnlyTransactionTest, ExactStalenessSnapshotReadTimestamp) {
-  ReadOnlyOptions opts;
-  opts.bound = TimestampBound::kExactStaleness;
-  opts.staleness = absl::Microseconds(1);
-
-  ReadOnlyTransaction txn(opts, txn_id_, &clock_, &storage_, &lock_manager_,
-                          &versioned_catalog_);
-  read_timestamp_ = txn.read_timestamp();
-  EXPECT_GT(clock_.Now() - absl::Microseconds(1), read_timestamp_);
+TEST_F(ReadOnlyTransactionTest, RejectsEveryHistoricalTimestampBound) {
+  for (const auto bound : {TimestampBound::kExactTimestamp,
+                          TimestampBound::kExactStaleness,
+                          TimestampBound::kMaxStaleness,
+                          TimestampBound::kMinTimestamp}) {
+    auto reader = Reader(ReadOnlyOptions{.bound = bound});
+    EXPECT_THAT(reader->status(), StatusIs(absl::StatusCode::kUnimplemented));
+    EXPECT_THAT(reader->GuardedCall([] { return absl::OkStatus(); }),
+                StatusIs(absl::StatusCode::kUnimplemented));
+  }
+  auto writer = Writer();
+  Acquire(writer.get());
+  GOOGLESQL_EXPECT_OK(writer->Wait());
+  writer->UnlockAll();
 }
 
-TEST_F(ReadOnlyTransactionTest, MaxStalenessSnapshotReadTimestamp) {
-  ReadOnlyOptions opts;
-  opts.bound = TimestampBound::kMaxStaleness;
-  opts.staleness = absl::Microseconds(1);
-
-  ReadOnlyTransaction txn(opts, txn_id_, &clock_, &storage_, &lock_manager_,
-                          &versioned_catalog_);
-  read_timestamp_ = txn.read_timestamp();
-  EXPECT_GT(clock_.Now(), read_timestamp_);
-  EXPECT_LE(opts.timestamp - opts.staleness, read_timestamp_);
+TEST_F(ReadOnlyTransactionTest, IdleReaderIsAbortedPermanentlyOnContention) {
+  auto reader = Reader();
+  GOOGLESQL_ASSERT_OK(reader->status());
+  auto writer = Writer();
+  Acquire(writer.get());
+  GOOGLESQL_ASSERT_OK(writer->Wait());
+  EXPECT_THAT(reader->status(), StatusIs(absl::StatusCode::kAborted));
+  writer->UnlockAll();
+  bool called = false;
+  EXPECT_THAT(reader->GuardedCall([&] {
+    called = true;
+    return absl::OkStatus();
+  }), StatusIs(absl::StatusCode::kAborted));
+  EXPECT_FALSE(called);
+  std::unique_ptr<RowCursor> cursor;
+  EXPECT_THAT(reader->Read(ReadArg{}, &cursor),
+              StatusIs(absl::StatusCode::kAborted));
 }
 
-TEST_F(ReadOnlyTransactionTest, MinTimestampSnapshotReadTimestamp) {
-  ReadOnlyOptions opts;
-  opts.bound = TimestampBound::kMinTimestamp;
-  opts.timestamp = t0_;
-
-  ReadOnlyTransaction txn(opts, txn_id_, &clock_, &storage_, &lock_manager_,
-                          &versioned_catalog_);
-  read_timestamp_ = txn.read_timestamp();
-  EXPECT_GT(clock_.Now(), read_timestamp_);
-  EXPECT_LE(t0_, read_timestamp_);
+TEST_F(ReadOnlyTransactionTest, SecondReaderAlsoAbortsIdleReader) {
+  auto first = Reader();
+  auto second = Reader();
+  GOOGLESQL_EXPECT_OK(second->status());
+  EXPECT_THAT(first->status(), StatusIs(absl::StatusCode::kAborted));
+  // Closing the old transaction must not release its successor's lock.
+  first->Close();
+  GOOGLESQL_EXPECT_OK(second->GuardedCall([&] {
+    auto writer = Writer();
+    Acquire(writer.get());
+    EXPECT_THAT(writer->Wait(), StatusIs(absl::StatusCode::kAborted));
+    return absl::OkStatus();
+  }));
 }
 
-TEST_F(ReadOnlyTransactionTest, ExactTimestampSnapshotReadTimestamp) {
-  ReadOnlyOptions opts;
-  opts.bound = TimestampBound::kExactTimestamp;
-  opts.timestamp = t0_;
-
-  ReadOnlyTransaction txn(opts, txn_id_, &clock_, &storage_, &lock_manager_,
-                          &versioned_catalog_);
-  read_timestamp_ = txn.read_timestamp();
-  EXPECT_EQ(t0_, read_timestamp_);
+TEST_F(ReadOnlyTransactionTest, ActiveRequestExcludesReadersWritersAndDdl) {
+  auto reader = Reader();
+  GOOGLESQL_ASSERT_OK(reader->status());
+  GOOGLESQL_EXPECT_OK(reader->GuardedCall([&] {
+    // A second thread tries to take ownership while SQL/streaming is active.
+    std::thread competitor([&] {
+      auto writer = Writer();
+      Acquire(writer.get());
+      EXPECT_THAT(writer->Wait(), StatusIs(absl::StatusCode::kAborted));
+      auto other_reader = Reader();
+      EXPECT_THAT(other_reader->status(), StatusIs(absl::StatusCode::kAborted));
+    });
+    competitor.join();
+    // A nested storage Read guard must not prematurely unpin the request.
+    GOOGLESQL_EXPECT_OK(reader->GuardedCall([] { return absl::OkStatus(); }));
+    auto writer = Writer();
+    Acquire(writer.get());
+    EXPECT_THAT(writer->Wait(), StatusIs(absl::StatusCode::kAborted));
+    return absl::OkStatus();
+  }));
+  GOOGLESQL_EXPECT_OK(reader->status());
 }
 
-TEST_F(ReadOnlyTransactionTest, GetSchema) {
-  VersionedCatalog catalog;
-  googlesql::TypeFactory type_factory{};
-  GOOGLESQL_EXPECT_OK(
-      catalog.AddSchema(t0_, test::CreateSchemaWithOneTable(&type_factory)));
-
-  // A strong read finds the schema created at t0_.
-  ReadOnlyOptions opts1;
-  opts1.bound = TimestampBound::kStrongRead;
-
-  ReadOnlyTransaction txn1(opts1, txn_id_, &clock_, &storage_, &lock_manager_,
-                           &catalog);
-  ASSERT_NE(txn1.schema(), nullptr);
-  ASSERT_NE(txn1.schema()->FindTable("test_table"), nullptr);
-
-  // A snapshot read at t0_ - 1 us gets an empty schema.
-  ReadOnlyOptions opts2;
-  opts2.bound = TimestampBound::kExactTimestamp;
-  opts2.timestamp = t0_ - absl::Microseconds(1);
-
-  ReadOnlyTransaction txn2(opts2, txn_id_, &clock_, &storage_, &lock_manager_,
-                           &catalog);
-  ASSERT_NE(txn2.schema(), nullptr);
-  EXPECT_EQ(txn2.schema()->FindTable("test_table"), nullptr);
+TEST_F(ReadOnlyTransactionTest, ExistingWriterPreventsReaderInitialization) {
+  auto writer = Writer();
+  Acquire(writer.get());
+  GOOGLESQL_ASSERT_OK(writer->Wait());
+  auto reader = Reader();
+  EXPECT_THAT(reader->status(), StatusIs(absl::StatusCode::kAborted));
+  EXPECT_EQ(reader->schema(), nullptr);
+  writer->UnlockAll();
 }
 
-TEST_F(ReadOnlyTransactionTest, WaitsForFutureReadTime) {
-  VersionedCatalog catalog;
-  googlesql::TypeFactory type_factory{};
-  GOOGLESQL_EXPECT_OK(
-      catalog.AddSchema(t0_, test::CreateSchemaWithOneTable(&type_factory)));
+TEST_F(ReadOnlyTransactionTest, DestructionAndCloseReleaseDatabaseOwnership) {
+  {
+    auto reader = Reader();
+    GOOGLESQL_ASSERT_OK(reader->status());
+  }
+  auto writer = Writer();
+  Acquire(writer.get());
+  GOOGLESQL_ASSERT_OK(writer->Wait());
+  writer->UnlockAll();
+  auto reader = Reader();
+  reader->Close();
+  EXPECT_FALSE(reader->status().ok());
+  Acquire(writer.get());
+  GOOGLESQL_EXPECT_OK(writer->Wait());
+  writer->UnlockAll();
+}
 
-  ReadOnlyOptions opts;
-  opts.bound = TimestampBound::kExactTimestamp;
-  opts.timestamp = clock_.Now() + absl::Microseconds(1000);
+TEST_F(ReadOnlyTransactionTest, CloseDuringRequestDefersUnlockUntilRequestEnds) {
+  auto reader = Reader();
+  GOOGLESQL_EXPECT_OK(reader->GuardedCall([&] {
+    reader->Close();
+    auto writer = Writer();
+    Acquire(writer.get());
+    EXPECT_THAT(writer->Wait(), StatusIs(absl::StatusCode::kAborted));
+    return absl::OkStatus();
+  }));
+  auto writer = Writer();
+  Acquire(writer.get());
+  GOOGLESQL_EXPECT_OK(writer->Wait());
+  writer->UnlockAll();
+}
 
-  ReadOnlyTransaction txn(opts, txn_id_, &clock_, &storage_, &lock_manager_,
-                          &catalog);
-  ASSERT_NE(txn.schema(), nullptr);
-  ASSERT_NE(txn.schema()->FindTable("test_table"), nullptr);
-
-  // A snapshot read at t0_ + 1000 will wait for read time to become current
-  // before being able to access database and return the schema.
-  EXPECT_GE(clock_.Now(), opts.timestamp);
+TEST_F(ReadOnlyTransactionTest, FailedRequestDoesNotLeaveAnUnabortableReader) {
+  auto reader = Reader();
+  EXPECT_THAT(reader->GuardedCall([] {
+    return absl::InvalidArgumentError("invalid query");
+  }), StatusIs(absl::StatusCode::kInvalidArgument));
+  auto writer = Writer();
+  Acquire(writer.get());
+  GOOGLESQL_EXPECT_OK(writer->Wait());
+  EXPECT_THAT(reader->status(), StatusIs(absl::StatusCode::kAborted));
+  writer->UnlockAll();
 }
 
 }  // namespace
-}  // namespace backend
-}  // namespace emulator
-}  // namespace spanner
-}  // namespace google
+}  // namespace google::spanner::emulator::backend

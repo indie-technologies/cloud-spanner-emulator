@@ -14,8 +14,13 @@
 // limitations under the License.
 //
 
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "absl/strings/str_cat.h"
+#include "backend/schema/printer/print_ddl.h"
 #include "backend/schema/updater/schema_updater_tests/base.h"
 
 namespace google {
@@ -25,6 +30,44 @@ namespace backend {
 namespace test {
 
 namespace {
+
+TEST_P(SchemaUpdaterTest, LongMigrationChainMatchesSeparateUpdates) {
+  const std::string create_table =
+      "CREATE TABLE T (Id INT64 NOT NULL, Value STRING(16)) PRIMARY KEY (Id)";
+  std::vector<std::string> migrations;
+  for (int i = 0; i < 24; ++i) {
+    migrations.push_back(absl::StrCat("ALTER TABLE T ADD COLUMN C", i, " INT64"));
+    migrations.push_back(absl::StrCat("CREATE INDEX I", i, " ON T(C", i,
+                                      ") STORING(Value)"));
+    // Reuse names after dropping objects, while the rest of the schema grows.
+    migrations.push_back("ALTER TABLE T ADD COLUMN Scratch INT64");
+    migrations.push_back("CREATE INDEX ScratchIndex ON T(Scratch)");
+    migrations.push_back("DROP INDEX ScratchIndex");
+    migrations.push_back("ALTER TABLE T DROP COLUMN Scratch");
+  }
+
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto initial, CreateSchema({create_table}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto batched,
+                                UpdateSchema(initial.get(), migrations));
+  std::unique_ptr<const Schema> sequential;
+  for (const auto& statement : migrations) {
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto next, UpdateSchema(sequential ? sequential.get() : initial.get(),
+                                {statement}));
+    sequential = std::move(next);
+  }
+
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto batched_ddl,
+                                PrintDDLStatements(batched.get()));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto sequential_ddl,
+                                PrintDDLStatements(sequential.get()));
+  // The PostgreSQL printer enumerates independent indexes in hash-map order.
+  EXPECT_THAT(batched_ddl, testing::UnorderedElementsAreArray(sequential_ddl));
+  EXPECT_EQ(initial->FindTable("T")->columns().size(), 2);
+  EXPECT_TRUE(initial->FindTable("T")->indexes().empty());
+  EXPECT_EQ(sequential->FindTable("T")->columns().size(), 26);
+  EXPECT_EQ(sequential->FindTable("T")->indexes().size(), 24);
+}
 
 TEST_P(SchemaUpdaterTest, CreationOrder) {
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto schema, CreateSchema({

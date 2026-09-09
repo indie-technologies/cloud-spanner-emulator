@@ -109,9 +109,14 @@ class QueryEngine {
                                          const QueryContext& context) const;
 
   // Executes a SQL query (SELECT query or DML) using the given query mode.
+  // Streaming callers may supply change_stream_metadata: a change-stream query
+  // is validated and returned as metadata without evaluating it here. Ordinary
+  // queries use the same analysis for detection and execution.
   absl::StatusOr<QueryResult> ExecuteSql(
       const Query& query, const QueryContext& context,
-      v1::ExecuteSqlRequest_QueryMode query_mode) const;
+      v1::ExecuteSqlRequest_QueryMode query_mode,
+      ChangeStreamQueryValidator::ChangeStreamMetadata* change_stream_metadata =
+          nullptr) const;
 
   absl::StatusOr<QueryResult> ExecuteInsertOnConflictDml(
       const Query& query,

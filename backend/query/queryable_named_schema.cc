@@ -17,6 +17,7 @@
 #include "backend/query/queryable_named_schema.h"
 
 #include <string>
+#include <utility>
 
 #include "googlesql/public/catalog.h"
 #include "googlesql/public/types/type.h"
@@ -31,9 +32,9 @@ namespace emulator {
 namespace backend {
 
 QueryableNamedSchema::QueryableNamedSchema(
-    const backend::NamedSchema* backend_named_schema) {
-  wrapped_named_schema_ = backend_named_schema;
-}
+    const backend::NamedSchema* backend_named_schema, TableLookup table_lookup)
+    : table_lookup_(std::move(table_lookup)),
+      wrapped_named_schema_(backend_named_schema) {}
 
 absl::Status QueryableNamedSchema::GetTable(const std::string& name,
                                             const googlesql::Table** table,
@@ -47,6 +48,11 @@ absl::Status QueryableNamedSchema::GetTable(const std::string& name,
   if (auto it = tables_.find(name); it != tables_.end()) {
     *table = it->second.get();
     return absl::OkStatus();
+  }
+
+  if (table_lookup_) {
+    *table = table_lookup_(FullName() + "." + name);
+    if (*table != nullptr) return absl::OkStatus();
   }
 
   return error::TableNotFound(name);
@@ -94,6 +100,14 @@ absl::Status QueryableNamedSchema::GetType(const std::string& name,
 
 absl::Status QueryableNamedSchema::GetTables(
     absl::flat_hash_set<const googlesql::Table*>* output) const {
+  if (table_lookup_) {
+    for (const auto* table : wrapped_named_schema_->tables()) {
+      output->insert(table_lookup_(table->Name()));
+    }
+    for (const auto* table : wrapped_named_schema_->synonyms()) {
+      output->insert(table_lookup_(table->synonym()));
+    }
+  }
   for (auto iter = tables_.begin(); iter != tables_.end(); ++iter) {
     output->insert(iter->second.get());
   }

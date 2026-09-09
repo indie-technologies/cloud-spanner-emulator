@@ -17,14 +17,12 @@
 #include "backend/schema/catalog/versioned_catalog.h"
 
 #include <memory>
+#include <utility>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
-#include "tests/common/proto_matchers.h"
-#include "absl/memory/memory.h"
 #include "absl/time/time.h"
-#include "backend/actions/manager.h"
 
 namespace google {
 namespace spanner {
@@ -32,68 +30,52 @@ namespace emulator {
 namespace backend {
 namespace {
 
-TEST(VersionedCatalogTest, FindSchemaAtTimeStamp) {
-  VersionedCatalog catalog;
-
-  absl::Time t1 = absl::Now();
-  absl::Time t2 = t1 + absl::Seconds(1);
-  absl::Time t3 = t2 + absl::Seconds(1);
-  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t1, std::make_unique<const Schema>()));
-  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t3, std::make_unique<const Schema>()));
-
-  // Find schemas created at t1 and t3.
-  const Schema* schema_t1 = catalog.GetSchema(t1);
-  const Schema* schema_t3 = catalog.GetSchema(t3);
-  EXPECT_NE(schema_t1, schema_t3);
-
-  // Find a schema created at or before t2; expect the schema created at t1.
-  EXPECT_EQ(catalog.GetSchema(t2), schema_t1);
-
-  // Find a schema created at or before t4; expect the schema created at t3.
-  absl::Time t4 = t3 + absl::Seconds(1);
-  EXPECT_EQ(catalog.GetSchema(t4), schema_t3);
-}
-
-TEST(VersionedCatalog, FirstAndLastSchema) {
-  VersionedCatalog catalog;
-  absl::Time t1 = absl::Now();
-  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t1, std::make_unique<const Schema>()));
-
-  // Find the default initial schema using absl::InfinitePast(). Expect it to be
-  // different from the schema created at t1.
-  EXPECT_NE(catalog.GetSchema(absl::InfinitePast()), catalog.GetSchema(t1));
-
-  // Find the last schema using absl::InfiniteFuture(). Expect the schema
-  // created at t1.
-  EXPECT_EQ(catalog.GetSchema(absl::InfiniteFuture()), catalog.GetSchema(t1));
-}
-
 TEST(VersionedCatalogTest, InitialSchema) {
-  absl::Time t1 = absl::Now();
-  VersionedCatalog catalog(std::make_unique<const Schema>());
-  absl::Time t0 = t1 - absl::Seconds(10);
+  VersionedCatalog catalog;
+  EXPECT_NE(catalog.GetLatestSchema(), nullptr);
+  EXPECT_EQ(catalog.GetLatestSchemaSnapshot().get(), catalog.GetLatestSchema());
 
-  // Verify that the initial schema can be read with a timestamp in the past.
-  EXPECT_EQ(catalog.GetSchema(t0), catalog.GetSchema(t1));
+  auto initial_schema = std::make_unique<const Schema>();
+  const Schema* initial = initial_schema.get();
+  VersionedCatalog initialized(std::move(initial_schema));
+  EXPECT_EQ(initialized.GetLatestSchema(), initial);
 }
 
-TEST(VersionedCatalogTest, FindFirstSchemaBeforeCreation) {
+TEST(VersionedCatalogTest, ReclaimsUnreferencedSchemasDuringLongMigrationChains) {
   VersionedCatalog catalog;
+  for (int i = 1; i <= 1024; ++i) {
+    std::weak_ptr<const Schema> previous = catalog.GetLatestSchemaSnapshot();
+    GOOGLESQL_ASSERT_OK(catalog.AddSchema(absl::UnixEpoch() + absl::Seconds(i),
+                                        std::make_unique<const Schema>()));
+    EXPECT_TRUE(previous.expired());
+    EXPECT_NE(catalog.GetLatestSchema(), nullptr);
+  }
+}
 
-  absl::Time t1 = absl::Now();
-  absl::Time t2 = t1 + absl::Seconds(1);
-  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t2, std::make_unique<const Schema>()));
-
-  // Confirm that the schema created at t2 is not visible at t1.
-  EXPECT_NE(catalog.GetSchema(t1), catalog.GetSchema(t2));
+TEST(VersionedCatalogTest, SnapshotRetainsSchemaUntilLastReaderReleasesIt) {
+  std::shared_ptr<const Schema> snapshot;
+  std::weak_ptr<const Schema> previous;
+  {
+    VersionedCatalog catalog;
+    snapshot = catalog.GetLatestSchemaSnapshot();
+    previous = snapshot;
+    GOOGLESQL_ASSERT_OK(catalog.AddSchema(absl::UnixEpoch(),
+                                        std::make_unique<const Schema>()));
+    EXPECT_NE(snapshot.get(), catalog.GetLatestSchema());
+    EXPECT_FALSE(previous.expired());
+  }
+  EXPECT_FALSE(previous.expired());
+  snapshot.reset();
+  EXPECT_TRUE(previous.expired());
 }
 
 TEST(VersionedCatalogTest, AddSchemaWithSameOrEarlierCreationTime) {
   VersionedCatalog catalog;
-  absl::Time t1 = absl::Now();
+  absl::Time t1 = absl::UnixEpoch();
   absl::Time t2 = t1 + absl::Seconds(1);
 
   GOOGLESQL_EXPECT_OK(catalog.AddSchema(t2, std::make_unique<const Schema>()));
+  const auto current = catalog.GetLatestSchemaSnapshot();
   EXPECT_THAT(catalog.AddSchema(t2, std::make_unique<const Schema>()),
               googlesql_base::testing::StatusIs(
                   absl::StatusCode::kInternal,
@@ -102,30 +84,7 @@ TEST(VersionedCatalogTest, AddSchemaWithSameOrEarlierCreationTime) {
               googlesql_base::testing::StatusIs(
                   absl::StatusCode::kInternal,
                   testing::MatchesRegex(".*Failed to insert schema.*")));
-}
-
-TEST(VersionedCatalogTest, ExpiredSchemasThatCoverRetentionPeriodAreKept) {
-  VersionedCatalog catalog;
-  ActionManager action_manager;
-  absl::Time t0 = absl::Now();
-  absl::Time t1 = t0 + absl::Minutes(10);
-  absl::Time t2 = t0 + absl::Minutes(40);
-  absl::Time t3 = t0 + absl::Hours(1) + absl::Seconds(1);
-  absl::Time t4 = t2 + absl::Hours(1) + absl::Seconds(1);
-
-  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t0, std::make_unique<const Schema>()));
-  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t1, std::make_unique<const Schema>()));
-  GOOGLESQL_EXPECT_OK(catalog.AddSchema(t2, std::make_unique<const Schema>()));
-
-  catalog.RemoveExpiredSchemas(t3);
-  // Verify that the schema created at t0 is not removed as it still covers the
-  // retention period.
-  EXPECT_NE(catalog.GetSchema(t0), catalog.GetSchema(absl::InfinitePast()));
-
-  catalog.RemoveExpiredSchemas(t4);
-  // Verify that the schema created at t0 is removed as it is no longer required
-  // to cover the retention period.
-  EXPECT_EQ(catalog.GetSchema(t0), catalog.GetSchema(absl::InfinitePast()));
+  EXPECT_EQ(catalog.GetLatestSchema(), current.get());
 }
 
 }  // namespace

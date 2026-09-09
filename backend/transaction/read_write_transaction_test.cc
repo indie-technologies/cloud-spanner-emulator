@@ -72,7 +72,7 @@ class ReadWriteTransactionTest : public testing::Test {
         std::make_unique<VersionedCatalog>(std::move(GetSchema()).value());
     action_manager_ = std::make_unique<ActionManager>();
     action_manager_->AddActionsForSchema(
-        versioned_catalog_->GetSchema(absl::InfiniteFuture()),
+        versioned_catalog_->GetLatestSchema(),
         /*function_catalog=*/nullptr, type_factory_.get());
   }
 
@@ -324,6 +324,46 @@ TEST_F(ReadWriteTransactionTest,
   EXPECT_EQ(txn2->state(), ReadWriteTransaction::State::kCommitted);
 
   config::set_abort_current_transaction_probability(current_probability);
+}
+
+TEST_F(ReadWriteTransactionTest, RequestGuardExcludesCompetingTransactions) {
+  auto txn = CreateReadWriteTransaction();
+  GOOGLESQL_EXPECT_OK(txn->GuardedRequest([&] {
+    // Even a request that has not read rows must own the database. An attempted
+    // abort during SQL evaluation or streaming must not hand off that lock.
+    auto competitor = CreateReadWriteTransaction();
+    EXPECT_FALSE(txn->TryAbort().ok());
+    EXPECT_THAT(competitor->GuardedRequest([] { return absl::OkStatus(); }),
+                StatusIs(absl::StatusCode::kAborted));
+    return absl::OkStatus();
+  }));
+  GOOGLESQL_EXPECT_OK(txn->Rollback());
+  auto next = CreateReadWriteTransaction();
+  GOOGLESQL_EXPECT_OK(next->GuardedRequest([] { return absl::OkStatus(); }));
+  GOOGLESQL_EXPECT_OK(next->Rollback());
+}
+
+TEST_F(ReadWriteTransactionTest, AbortedRequestCannotExecuteWithoutStorageReads) {
+  auto txn = CreateReadWriteTransaction();
+  GOOGLESQL_ASSERT_OK(txn->EnsureActive());
+  GOOGLESQL_ASSERT_OK(txn->TryAbort());
+  bool executed = false;
+  EXPECT_THAT(txn->GuardedRequest([&] {
+    executed = true;
+    return absl::OkStatus();
+  }), StatusIs(absl::StatusCode::kAborted));
+  EXPECT_FALSE(executed);
+  GOOGLESQL_EXPECT_OK(txn->Rollback());
+}
+
+TEST_F(ReadWriteTransactionTest, DestroyingUncommittedTransactionReleasesLock) {
+  {
+    auto txn = CreateReadWriteTransaction();
+    GOOGLESQL_ASSERT_OK(txn->GuardedRequest([] { return absl::OkStatus(); }));
+  }
+  auto next = CreateReadWriteTransaction();
+  GOOGLESQL_EXPECT_OK(next->GuardedRequest([] { return absl::OkStatus(); }));
+  GOOGLESQL_EXPECT_OK(next->Rollback());
 }
 
 TEST_F(ReadWriteTransactionTest, ConcurrentTransactionsEventuallySucceed) {

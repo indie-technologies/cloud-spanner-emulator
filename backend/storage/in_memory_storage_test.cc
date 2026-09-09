@@ -114,58 +114,28 @@ TEST_F(InMemoryStorageTest, ReadRangeFromSingleTable) {
   EXPECT_FALSE(itr_->Next());
 }
 
-TEST_F(InMemoryStorageTest, LookupByTimestamp) {
-  absl::Time write_ts = absl::Now();
-
-  GOOGLESQL_EXPECT_OK(storage_.Write(write_ts, kTableId0, Key({Int64(1)}), {kColumnID},
-                           {String("value-1")}));
-
-  // Lookup key at exact timestamp it was written.
+TEST_F(InMemoryStorageTest, WritesReplaceCurrentCellValues) {
+  const auto now = absl::Now();
+  const Key key({Int64(1)});
+  for (int i = 0; i < 1000; ++i) {
+    GOOGLESQL_ASSERT_OK(storage_.Write(now + absl::Seconds(i), kTableId0, key,
+                                      {kColumnID}, {Int64(i)}));
+  }
   std::vector<googlesql::Value> values;
-  GOOGLESQL_EXPECT_OK(storage_.Lookup(write_ts, kTableId0, Key({Int64(1)}), {kColumnID},
-                            &values));
-  EXPECT_THAT(values, testing::ElementsAre(String("value-1")));
-
-  // Lookup key at a future timestamp.
-  absl::Time lookup_in_future_ts = write_ts + absl::Nanoseconds(24);
-  GOOGLESQL_EXPECT_OK(storage_.Lookup(lookup_in_future_ts, kTableId0, Key({Int64(1)}),
-                            {kColumnID}, &values));
-  EXPECT_THAT(values, testing::ElementsAre(String("value-1")));
-
-  // Lookup key at timestamp before the first time it was written.
-  absl::Time lookup_before_write_ts = write_ts - absl::Nanoseconds(1);
-  EXPECT_THAT(storage_.Lookup(lookup_before_write_ts, kTableId0,
-                              Key({Int64(1)}), {kColumnID}, &values),
-              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
-  EXPECT_TRUE(values.empty());
+  // Storage timestamps are compatibility parameters, not historical reads.
+  GOOGLESQL_ASSERT_OK(storage_.Lookup(now, kTableId0, key, {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(Int64(999)));
 }
 
-TEST_F(InMemoryStorageTest, ReadByTimestamp) {
-  absl::Time write_ts = absl::Now();
-
-  // Write into table.
-  GOOGLESQL_EXPECT_OK(storage_.Write(write_ts, kTableId0, Key({Int64(1)}), {kColumnID},
-                           {String("value-1")}));
-
-  // Read key at the exact timestamp it was written.
-  GOOGLESQL_EXPECT_OK(
-      storage_.Read(write_ts, kTableId0, kKeyRange0To5, {kColumnID}, &itr_));
-  EXPECT_TRUE(itr_->Next());
-  EXPECT_EQ(itr_->ColumnValue(0), String("value-1"));
-  EXPECT_EQ(itr_->Key(), Key({Int64(1)}));
-
-  // Read key at a future timestamp.
-  absl::Time read_in_future_ts = write_ts + absl::Nanoseconds(24);
-  GOOGLESQL_EXPECT_OK(storage_.Read(read_in_future_ts, kTableId0, kKeyRange0To5,
-                          {kColumnID}, &itr_));
-  EXPECT_TRUE(itr_->Next());
-  EXPECT_EQ(itr_->ColumnValue(0), String("value-1"));
-  EXPECT_EQ(itr_->Key(), Key({Int64(1)}));
-
-  // Read key at timestamp before the first time it was written.
-  absl::Time read_before_write_ts = write_ts - absl::Nanoseconds(1);
-  GOOGLESQL_EXPECT_OK(storage_.Read(read_before_write_ts, kTableId0, kKeyRange0To5,
-                          {kColumnID}, &itr_));
+TEST_F(InMemoryStorageTest, ReadReturnsCurrentValues) {
+  const auto now = absl::Now();
+  const Key key({Int64(1)});
+  GOOGLESQL_ASSERT_OK(storage_.Write(now, kTableId0, key, {kColumnID}, {Int64(1)}));
+  GOOGLESQL_ASSERT_OK(storage_.Write(now + absl::Seconds(1), kTableId0, key,
+                                    {kColumnID}, {Int64(2)}));
+  GOOGLESQL_ASSERT_OK(storage_.Read(now, kTableId0, kKeyRange0To5, {kColumnID}, &itr_));
+  ASSERT_TRUE(itr_->Next());
+  EXPECT_EQ(itr_->ColumnValue(0), Int64(2));
   EXPECT_FALSE(itr_->Next());
 }
 
@@ -585,37 +555,26 @@ TEST_F(InMemoryStorageTest, LookupAtOrAfterDeleteTimestampReturnsInvalidValue) {
       googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
 }
 
-TEST_F(InMemoryStorageTest, LookupBeforeDeleteTimestampReturnsValidValue) {
-  absl::Time write_ts = absl::Now();
-  absl::Time before_delete_ts = write_ts + absl::Seconds(1);
-  absl::Time delete_ts = before_delete_ts + absl::Seconds(1);
-  Key key({Int64(1)});
-
-  GOOGLESQL_EXPECT_OK(storage_.Write(write_ts, kTableId0, key, {kColumnID},
-                           {String("value-10")}));
-  GOOGLESQL_EXPECT_OK(storage_.Delete(delete_ts, kTableId0, KeyRange::Point(key)));
+TEST_F(InMemoryStorageTest, DeleteRemovesRowRegardlessOfReadTimestamp) {
+  const auto now = absl::Now();
+  const Key key({Int64(1)});
+  GOOGLESQL_ASSERT_OK(storage_.Write(now, kTableId0, key, {kColumnID}, {Int64(1)}));
+  GOOGLESQL_ASSERT_OK(storage_.Delete(now + absl::Seconds(1), kTableId0,
+                                     KeyRange::Point(key)));
   std::vector<googlesql::Value> values;
-  GOOGLESQL_EXPECT_OK(
-      storage_.Lookup(before_delete_ts, kTableId0, key, {kColumnID}, &values));
-  EXPECT_THAT(values, testing::ElementsAre(String("value-10")));
+  EXPECT_THAT(storage_.Lookup(now, kTableId0, key, {kColumnID}, &values),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
 }
 
-TEST_F(InMemoryStorageTest, SnapshotRead) {
-  absl::Time write_ts = absl::Now();
-  absl::Time snapshot_read_ts = write_ts + absl::Seconds(1);
-  absl::Time second_write_ts = snapshot_read_ts + absl::Seconds(1);
-  Key key({Int64(1)});
-
-  GOOGLESQL_EXPECT_OK(storage_.Write(write_ts, kTableId0, key, {kColumnID},
-                           {String("value-10")}));
-  GOOGLESQL_EXPECT_OK(storage_.Write(second_write_ts, kTableId0, key, {kColumnID},
-                           {String("value-20")}));
-
-  // Snapshot Read.
-  GOOGLESQL_EXPECT_OK(storage_.Read(snapshot_read_ts, kTableId0, kKeyRange0To5,
-                          {kColumnID}, &itr_));
-  EXPECT_TRUE(itr_->Next());
-  EXPECT_EQ(itr_->ColumnValue(0), String("value-10"));
+TEST_F(InMemoryStorageTest, MaterializedIteratorOwnsItsValues) {
+  const auto now = absl::Now();
+  const Key key({Int64(1)});
+  GOOGLESQL_ASSERT_OK(storage_.Write(now, kTableId0, key, {kColumnID}, {Int64(1)}));
+  GOOGLESQL_ASSERT_OK(storage_.Read(now, kTableId0, kKeyRange0To5, {kColumnID}, &itr_));
+  GOOGLESQL_ASSERT_OK(storage_.Delete(now, kTableId0, KeyRange::All()));
+  ASSERT_TRUE(itr_->Next());
+  EXPECT_EQ(itr_->ColumnValue(0), Int64(1));
+  EXPECT_FALSE(itr_->Next());
 }
 
 TEST_F(InMemoryStorageTest, ReadUsingKeyRangeAll) {
@@ -746,84 +705,6 @@ TEST_F(InMemoryStorageTest, DroppedColumnsAreRemovedAfterRetentionPeriod) {
         storage_.Lookup(t0, kTableId0, Key({Int64(i)}), {kColumnID}, &values));
     EXPECT_THAT(values, testing::ElementsAre(googlesql::Value()));
   }
-}
-
-TEST_F(InMemoryStorageTest, ExpiredCellsThatCoverRetentionPeriodAreKept) {
-  absl::Time t0 = absl::Now();
-  absl::Time t1 = t0 + absl::Minutes(10);
-  absl::Time t2 = t0 + absl::Minutes(40);
-  absl::Time t3 = t0 + absl::Hours(1) + absl::Seconds(1);
-  absl::Time t4 = t2 + absl::Hours(1) + absl::Seconds(1);
-
-  // Write into column.
-  GOOGLESQL_EXPECT_OK(storage_.Write(t0, kTableId0, Key({Int64(1)}), {kColumnID},
-                           {String("value-0")}));
-  GOOGLESQL_EXPECT_OK(storage_.Write(t2, kTableId0, Key({Int64(1)}), {kColumnID},
-                           {String("value-2")}));
-
-  // Write to remove expired values.
-  GOOGLESQL_EXPECT_OK(storage_.Write(t3, kTableId0, Key({Int64(1)}), {kColumnID},
-                           {String("value-3")}));
-
-  // Lookup of t1 should return the first value which shouldn't be cleaned up
-  // because it covers the retention period.
-  std::vector<googlesql::Value> values;
-  GOOGLESQL_EXPECT_OK(
-      storage_.Lookup(t1, kTableId0, Key({Int64(1)}), {kColumnID}, &values));
-  EXPECT_THAT(values, testing::ElementsAre(String("value-0")));
-
-  GOOGLESQL_EXPECT_OK(storage_.Write(t4, kTableId0, Key({Int64(1)}), {kColumnID},
-                           {String("value-4")}));
-
-  // Lookup of t1 should return an empty value because the first value was
-  // cleaned up as it doesn't cover the retention period.
-  values.clear();
-  GOOGLESQL_EXPECT_OK(
-      storage_.Lookup(t1, kTableId0, Key({Int64(1)}), {kColumnID}, &values));
-  EXPECT_THAT(values, testing::ElementsAre(googlesql::Value()));
-}
-
-TEST_F(InMemoryStorageTest, RemoveExpiredVersionsFromCellOnWrite) {
-  absl::Time t0 = absl::Now();
-  absl::Time t1 = t0 + absl::Seconds(1);
-  absl::Time t2 = t1 + absl::Hours(1);
-
-  // Write into column.
-  GOOGLESQL_EXPECT_OK(storage_.Write(t0, kTableId0, Key({Int64(1)}), {kColumnID},
-                           {String("value-0")}));
-  GOOGLESQL_EXPECT_OK(storage_.Write(t1, kTableId0, Key({Int64(1)}), {kColumnID},
-                           {String("value-1")}));
-
-  // Write should remove the t0 value as that will be expired.
-  GOOGLESQL_EXPECT_OK(storage_.Write(t2, kTableId0, Key({Int64(1)}), {kColumnID},
-                           {String("value-2")}));
-
-  // Lookup of t0 should return an empty value because the value was cleaned up.
-  std::vector<googlesql::Value> values;
-  GOOGLESQL_EXPECT_OK(
-      storage_.Lookup(t0, kTableId0, Key({Int64(1)}), {kColumnID}, &values));
-  EXPECT_THAT(values, testing::ElementsAre(googlesql::Value()));
-}
-
-TEST_F(InMemoryStorageTest, RemoveExpiredVersionsFromCellOnDelete) {
-  absl::Time t0 = absl::Now();
-  absl::Time t1 = t0 + absl::Seconds(1);
-  absl::Time t2 = t1 + absl::Hours(1);
-
-  // Write into column.
-  GOOGLESQL_EXPECT_OK(storage_.Write(t0, kTableId0, Key({Int64(1)}), {kColumnID},
-                           {String("value-0")}));
-  GOOGLESQL_EXPECT_OK(storage_.Write(t1, kTableId0, Key({Int64(1)}), {kColumnID},
-                           {String("value-1")}));
-
-  // Delete should remove the t0 value as that will be expired.
-  GOOGLESQL_EXPECT_OK(storage_.Delete(t2, kTableId0, KeyRange::Point(Key({Int64(1)}))));
-
-  // Lookup of t0 should return an empty value because the value was cleaned up.
-  std::vector<googlesql::Value> values;
-  GOOGLESQL_EXPECT_OK(
-      storage_.Lookup(t0, kTableId0, Key({Int64(1)}), {kColumnID}, &values));
-  EXPECT_THAT(values, testing::ElementsAre(googlesql::Value()));
 }
 
 }  // namespace

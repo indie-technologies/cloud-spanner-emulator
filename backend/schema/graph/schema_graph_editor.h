@@ -252,7 +252,7 @@ class SchemaGraphEditor {
   // original nodes to clones.
   absl::Status InitCloneMap();
 
-  // Returns OK if 'node' is present in the original graph.
+  // Returns true if 'node' is present in the original graph.
   bool IsOriginalNode(const SchemaNode* node) const;
 
   // Creates and registers a clone for 'node'.

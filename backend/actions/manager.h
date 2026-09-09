@@ -105,11 +105,11 @@ class ActionRegistry {
   Catalog catalog_;
 };
 
-// ActionManager manages the registry of actions for each schema in the
-// database.
+// ActionManager lazily builds the write actions for the current schema.
+// Callers must exclude schema changes while using the returned registry.
 class ActionManager {
  public:
-  // Builds the registry of actions for given schema and function_catalog.
+  // Registers the current schema. The registry is built on first use.
   void AddActionsForSchema(const Schema* schema,
                            const FunctionCatalog* function_catalog,
                            googlesql::TypeFactory* type_factory);
@@ -119,8 +119,10 @@ class ActionManager {
       const Schema* schema) const;
 
  private:
-  const Schema* latest_schema_ ABSL_GUARDED_BY(mutex_);
-  std::unique_ptr<ActionRegistry> registry_ ABSL_GUARDED_BY(mutex_);
+  const Schema* latest_schema_ ABSL_GUARDED_BY(mutex_) = nullptr;
+  const FunctionCatalog* function_catalog_ ABSL_GUARDED_BY(mutex_) = nullptr;
+  googlesql::TypeFactory* type_factory_ ABSL_GUARDED_BY(mutex_) = nullptr;
+  mutable std::unique_ptr<ActionRegistry> registry_ ABSL_GUARDED_BY(mutex_);
 
   mutable absl::Mutex mutex_;
 };

@@ -17,6 +17,7 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_TRANSACTION_READ_ONLY_TRANSACTION_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_TRANSACTION_READ_ONLY_TRANSACTION_H_
 
+#include <functional>
 #include <memory>
 
 #include "absl/base/thread_annotations.h"
@@ -24,25 +25,22 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "backend/access/read.h"
-#include "backend/access/write.h"
 #include "backend/common/ids.h"
 #include "backend/locking/manager.h"
 #include "backend/schema/catalog/versioned_catalog.h"
 #include "backend/storage/storage.h"
 #include "backend/transaction/options.h"
-#include "backend/transaction/transaction_store.h"
 #include "common/clock.h"
 #include "common/errors.h"
-#include "absl/status/status.h"
 
 namespace google {
 namespace spanner {
 namespace emulator {
 namespace backend {
 
-// ReadOnlyTransaction is a read-only transaction that reads from a specific
-// timestamp. ReadOnlyTransaction reads the database without needing to acquire
-// any locks.
+// A strong read-only transaction holds the database lock until closed or
+// aborted. An idle transaction can be aborted by a competing transaction;
+// it must never be reused with a newer view of the database.
 //
 // ReadOnlyTransaction cannot be committed, rolled-back, or be used to run DMLs.
 class ReadOnlyTransaction : public RowReader {
@@ -52,14 +50,24 @@ class ReadOnlyTransaction : public RowReader {
                       Storage* storage, LockManager* lock_manager,
                       const VersionedCatalog* versioned_catalog);
 
+  ~ReadOnlyTransaction() override;
+
+  // Protects a whole request (including SQL evaluation and result streaming)
+  // from lock handoff. May be nested by individual Read() calls.
+  absl::Status GuardedCall(const std::function<absl::Status()>& fn);
+
+  absl::Status status() const;
+  void Close();
+
   absl::Status Read(const ReadArg& read_arg,
                     std::unique_ptr<RowCursor>* cursor) override
       ABSL_LOCKS_EXCLUDED(mu_);
 
   absl::Time read_timestamp() const { return read_timestamp_; }
 
-  // Returns the schema used by this transaction.
-  const Schema* schema() const;
+  // Returns the schema selected on initialization. Use within GuardedCall()
+  // so that an aborted transaction cannot resolve reads against an old schema.
+  const Schema* schema() const { return schema_; }
 
   // Returns the ID of this transaction.
   const TransactionID id() const { return id_; }
@@ -68,11 +76,11 @@ class ReadOnlyTransaction : public RowReader {
   const ReadOnlyOptions& options() const { return options_; }
 
  private:
-  // Mutex that guards the Read method.
-  absl::Mutex mu_;
+  absl::Status TryAbort();
 
-  // Picks a read timestamp given transaction type and timestamp bound.
-  absl::Time PickReadTimestamp();
+  mutable absl::Mutex mu_;
+  absl::Status status_ ABSL_GUARDED_BY(mu_);
+  int active_requests_ ABSL_GUARDED_BY(mu_) = 0;
 
   // Options with which the transaction was created.
   ReadOnlyOptions options_;
@@ -89,15 +97,15 @@ class ReadOnlyTransaction : public RowReader {
   // VersionedCatalog for the database provided at transaction creation.
   const VersionedCatalog* const versioned_catalog_;
 
+  // Keeps cursor metadata alive even after this transaction is aborted.
+  std::shared_ptr<const Schema> schema_snapshot_;
+
   // Transaction lock management.
   std::unique_ptr<LockHandle> lock_handle_;
-  LockManager* lock_manager_;
 
   // The read timestamp picked by this transaction.
-  absl::Time read_timestamp_;
-
-  // The version retention period for the database.
-  const absl::Duration version_retention_period_;
+  absl::Time read_timestamp_ = absl::InfinitePast();
+  const Schema* schema_ = nullptr;
 };
 
 }  // namespace backend

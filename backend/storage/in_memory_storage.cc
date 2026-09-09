@@ -32,50 +32,10 @@ namespace spanner {
 namespace emulator {
 namespace backend {
 
-namespace {
-
-static constexpr char kExistsColumn[] = "_exists";
-
-}  // namespace
-
-void InMemoryStorage::RemoveExpiredVersions(Cell& cell, absl::Time timestamp) {
-  absl::MutexLock lock(version_retention_period_mu_);
-  auto it = cell.begin();
-  auto upper_bound = cell.upper_bound(timestamp - version_retention_period_);
-  while (it != upper_bound) {
-    auto next = it;
-    if (++next == upper_bound) {
-      // The current value needs to be kept to cover the retention period.
-      break;
-    }
-    it = cell.erase(it);
-  }
-}
-
-googlesql::Value InMemoryStorage::GetCellValueAtTimestamp(
-    const Row& row, const ColumnID& column_id, absl::Time timestamp) const {
-  // Perform the lookup for given cell.
-  auto cell_itr = row.find(column_id);
-  if (cell_itr == row.end()) {
-    return googlesql::Value();
-  }
-  const Cell& cell = cell_itr->second;
-  auto val_itr = cell.upper_bound(timestamp);
-
-  // Timestamp is earlier than the time the cell was first written to.
-  if (val_itr == cell.begin()) {
-    return googlesql::Value();
-  }
-
-  // Fetch the value from the column.
-  --val_itr;
-  return val_itr->second;
-}
-
-bool InMemoryStorage::Exists(const Row& row, absl::Time timestamp) const {
-  googlesql::Value value =
-      GetCellValueAtTimestamp(row, kExistsColumn, timestamp);
-  return value.is_valid() && value.bool_value();
+googlesql::Value InMemoryStorage::GetCellValue(
+    const Row& row, const ColumnID& column_id) const {
+  auto cell = row.find(column_id);
+  return cell == row.end() ? googlesql::Value() : cell->second;
 }
 
 absl::Status InMemoryStorage::Lookup(
@@ -114,24 +74,15 @@ absl::Status InMemoryStorage::Lookup(
   }
   const Row& row = row_itr->second;
 
-  // Verify if the row exists at the given timestamp.
-  if (!Exists(row, timestamp)) {
-    return absl::Status(
-        absl::StatusCode::kNotFound,
-        absl::StrCat(
-            "Key: ", key.DebugString(), " does not exist for table: ", table_id,
-            " at the given timestamp: " + absl::FormatTime(timestamp)));
-  }
-
   // For request without columns, return ok since the key exist.
   if (column_ids.empty()) {
     return absl::OkStatus();
   }
 
-  // Fetch the value from the cell at the given timestamp.
-  for (int i = 0; i < column_ids.size(); ++i) {
-    values->emplace_back(
-        GetCellValueAtTimestamp(row, column_ids[i], timestamp));
+  // Fetch the current value of each column.
+  values->reserve(column_ids.size());
+  for (const auto& column_id : column_ids) {
+    values->emplace_back(GetCellValue(row, column_id));
   }
 
   return absl::OkStatus();
@@ -171,16 +122,13 @@ absl::Status InMemoryStorage::Read(
   auto row_end_itr = table.lower_bound(key_range.limit_key());
   for (auto itr = row_start_itr; itr != row_end_itr; ++itr) {
     const InMemoryStorage::Row& row = itr->second;
-    if (!Exists(row, timestamp)) {
-      continue;
-    }
 
     std::vector<googlesql::Value> values;
     values.reserve(column_ids.size());
     for (const ColumnID& column_id : column_ids) {
-      values.emplace_back(GetCellValueAtTimestamp(row, column_id, timestamp));
+      values.emplace_back(GetCellValue(row, column_id));
     }
-    rows.emplace_back(std::make_pair(itr->first, values));
+    rows.emplace_back(itr->first, std::move(values));
   }
   *itr = std::make_unique<FixedRowStorageIterator>(std::move(rows));
   return absl::OkStatus();
@@ -195,19 +143,10 @@ absl::Status InMemoryStorage::Write(
   // Add the table if it does not exist.
   Table& table = tables_[table_id];
 
-  // Add the row with _exists system column if it does not exist.
+  // An empty row still represents an existing key.
   Row& row = table[key];
-  if (!Exists(row, timestamp)) {
-    Cell& cell = row[kExistsColumn];
-    cell[timestamp] = googlesql::values::Bool(true);
-    RemoveExpiredVersions(cell, timestamp);
-  }
-
-  // Add the values for the given columns.
   for (int i = 0; i < column_ids.size(); ++i) {
-    Cell& cell = row[column_ids[i]];
-    cell[timestamp] = values[i];
-    RemoveExpiredVersions(cell, timestamp);
+    row[column_ids[i]] = values[i];
   }
 
   return absl::OkStatus();
@@ -242,26 +181,7 @@ absl::Status InMemoryStorage::Delete(absl::Time timestamp,
   }
   auto row_end_itr = table.lower_bound(key_range.limit_key());
 
-  // Mark the keys as deleted.
-  for (auto itr = row_start_itr; itr != row_end_itr; ++itr) {
-    if (!Exists(itr->second, timestamp)) {
-      continue;
-    }
-
-    for (const auto& columns : itr->second) {
-      if (columns.first == kExistsColumn) {
-        Cell& cell = itr->second[kExistsColumn];
-        cell[timestamp] = googlesql::values::Bool(false);
-        RemoveExpiredVersions(cell, timestamp);
-      } else {
-        // Column values are marked invalid googlesql::Value to avoid reading
-        // the value of the cell before the delete.
-        Cell& cell = itr->second[columns.first];
-        cell[timestamp] = googlesql::Value();
-        RemoveExpiredVersions(cell, timestamp);
-      }
-    }
-  }
+  table.erase(row_start_itr, row_end_itr);
   return absl::OkStatus();
 }
 
