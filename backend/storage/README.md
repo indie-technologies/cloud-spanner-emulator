@@ -1,10 +1,19 @@
-# Single-version storage
+# Current-value storage with active snapshots
 
 This fork stores the current value of each cell directly and physically removes
 rows on deletion. It no longer allocates timestamp maps, maintains a versioned
 row-existence column, collects expired cell versions, or traverses deleted rows
-during scans. The transaction layer excludes competing transactions while a
-request uses the database. Historical/stale read options are rejected.
+during scans when no snapshot needs those rows. Concurrent strong readers pin a
+snapshot; the first subsequent change to each row saves its original value for
+that snapshot. Closing the reader releases its before-images. No data is copied
+at snapshot creation and no time-based row history is retained. Historical/stale
+read options are rejected.
+
+Writers still buffer changes until commit. A short publication lock excludes
+snapshot registration during a commit or schema update, while existing readers
+can continue reading their original data. Active SQL requests hold a shared
+schema lock to protect functions that reference the latest schema during DDL.
+Idle readers keep their schema and data without blocking later migrations.
 
 The timestamp arguments on `Storage` remain for internal callers, including
 schema backfills. They no longer select historical row values. The schema catalog
@@ -23,7 +32,8 @@ bazel run -c opt //backend/storage:in_memory_storage_benchmark -- \
 
 Measured on macOS arm64 on September 9, 2026, in a release build. These are median
 CPU times over three repetitions, comparing the same benchmark against the
-original storage implementation at `fc811a1a` and the current implementation.
+original storage implementation at `fc811a1a` and the implementation before
+concurrent snapshots were restored.
 The baseline was built under a separate class name; temporary baseline sources
 and build targets were removed afterward.
 
@@ -67,8 +77,11 @@ credentials, `strerror_r`, file allocation/synchronization, and `librt`), plus
 `--features=-layering_check`. Those workarounds were restored after testing;
 no PostgreSQL platform changes are part of this patch.
 
-Concurrency tests cover permanent read-only aborts, protected active requests,
-lock release, SQL that performs no storage reads, and multiplexed sessions.
+Concurrency tests cover readers overlapping writers, atomic snapshot publication,
+updates/deletes/reinserts, dropped schema objects, repeated reads across commits,
+SQL that performs no storage reads, and multiplexed sessions. Randomized scans
+are compared with independently copied maps. Database tests also check data and
+index consistency across DDL and multi-row commits.
 Change-stream tests retry complete operations on contention, including the
 schema API's `FAILED_PRECONDITION` response. DML replay and rollback tests remain
 part of the passing SQL/transaction suites.

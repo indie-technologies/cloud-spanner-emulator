@@ -17,21 +17,23 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 
-#include "googlesql/public/value.h"
+#include <memory>
+#include <vector>
+
 #include "absl/status/status.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
 #include "backend/datamodel/key.h"
 #include "backend/datamodel/key_range.h"
 #include "backend/storage/iterator.h"
-#include "absl/status/status.h"
+#include "googlesql/public/value.h"
 
 namespace google {
 namespace spanner {
 namespace emulator {
 namespace backend {
 
-// Storage defines the interface for a multi-version data store.
+// Storage defines the interface for current data and pinned read snapshots.
 //
 // There will be a Storage instance for each database created.
 // Storage is thread-safe.
@@ -39,12 +41,17 @@ class Storage {
  public:
   virtual ~Storage() {}
 
-  // Returns current column values for the given key. Timestamps are retained
-  // for commit/backfill callers; they do not select historical versions.
-  // Returns NOT_FOUND if the given key does not exist. For a given row if the
-  // column value is not set, it returns an invalid googlesql::Value, i.e. one
-  // for which is_valid() is false. Column values are always set in order of the
-  // columns defined in column_ids.
+  // Pins the current contents. The caller must exclude commits/schema changes
+  // while creating a snapshot so it cannot observe a partially applied batch.
+  // The returned read-only view must not outlive this storage.
+  virtual std::unique_ptr<Storage> CreateSnapshot() = 0;
+
+  // Returns column values from this view for the given key. Timestamps are
+  // retained for commit/backfill callers; they do not select historical
+  // versions. Returns NOT_FOUND if the given key does not exist. For a given
+  // row if the column value is not set, it returns an invalid googlesql::Value,
+  // i.e. one for which is_valid() is false. Column values are always set in
+  // order of the columns defined in column_ids.
   virtual absl::Status Lookup(absl::Time timestamp, const TableID& table_id,
                               const Key& key,
                               const std::vector<ColumnID>& column_ids,
@@ -65,15 +72,16 @@ class Storage {
                              const std::vector<ColumnID>& column_ids,
                              const std::vector<googlesql::Value>& values) = 0;
 
-  // Removes the given key range. Previous row values are not retained.
+  // Removes the given key range, preserving any active snapshots.
   // KeyRange interval should be in KeyRange::ClosedOpen format. Non ClosedOpen
   // ranges will result in INVALID_ARGUMENT.
   virtual absl::Status Delete(absl::Time timestamp, const TableID& table_id,
                               const KeyRange& key_range) = 0;
 
   // Sets the version retention period from the database options.
-  // This determines when to reclaim dropped tables and columns. Row values
-  // themselves are not versioned.
+  // This determines when to reclaim dropped tables and columns. Row
+  // before-images are retained only for active snapshots, independent of this
+  // period.
   virtual void SetVersionRetentionPeriod(
       absl::Duration version_retention_period) = 0;
 

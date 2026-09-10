@@ -88,8 +88,8 @@ class ReadApiTest : public test::ServerTest {
   std::string test_session_uri_;
 };
 
-TEST_F(ReadApiTest, CannotReadBeyondVersionGCLimit) {
-  // Cloud Spanner does not allow read only transactions with a staleness > 1h.
+TEST_F(ReadApiTest, ExplicitStalenessRemainsUnsupported) {
+  // Concurrent strong snapshots do not restore historical timestamp bounds.
   spanner_api::ReadRequest read_request = PARSE_TEXT_PROTO(
       R"pb(
         transaction {
@@ -101,9 +101,16 @@ TEST_F(ReadApiTest, CannotReadBeyondVersionGCLimit) {
       )pb");
   read_request.set_session(test_session_uri_);
 
-  spanner_api::ResultSet read_response;
-  EXPECT_THAT(Read(read_request, &read_response),
-              StatusIs(absl::StatusCode::kFailedPrecondition));
+  for (int seconds : {1, 3601}) {
+    read_request.mutable_transaction()
+        ->mutable_single_use()
+        ->mutable_read_only()
+        ->mutable_exact_staleness()
+        ->set_seconds(seconds);
+    spanner_api::ResultSet read_response;
+    EXPECT_THAT(Read(read_request, &read_response),
+                StatusIs(absl::StatusCode::kUnimplemented));
+  }
 }
 
 TEST_F(ReadApiTest, CanReadUsingAnAlreadyStartedTransaction) {

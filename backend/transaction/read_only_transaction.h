@@ -38,9 +38,8 @@ namespace spanner {
 namespace emulator {
 namespace backend {
 
-// A strong read-only transaction holds the database lock until closed or
-// aborted. An idle transaction can be aborted by a competing transaction;
-// it must never be reused with a newer view of the database.
+// A strong read-only transaction pins committed data and its schema. Writers
+// retain before-images only while these snapshots are alive.
 //
 // ReadOnlyTransaction cannot be committed, rolled-back, or be used to run DMLs.
 class ReadOnlyTransaction : public RowReader {
@@ -52,8 +51,8 @@ class ReadOnlyTransaction : public RowReader {
 
   ~ReadOnlyTransaction() override;
 
-  // Protects a whole request (including SQL evaluation and result streaming)
-  // from lock handoff. May be nested by individual Read() calls.
+  // Keeps snapshot resources alive through SQL evaluation and streaming, and
+  // protects functions referencing the latest schema from concurrent DDL.
   absl::Status GuardedCall(const std::function<absl::Status()>& fn);
 
   absl::Status status() const;
@@ -65,8 +64,7 @@ class ReadOnlyTransaction : public RowReader {
 
   absl::Time read_timestamp() const { return read_timestamp_; }
 
-  // Returns the schema selected on initialization. Use within GuardedCall()
-  // so that an aborted transaction cannot resolve reads against an old schema.
+  // Returns the immutable schema pinned for this transaction.
   const Schema* schema() const { return schema_; }
 
   // Returns the ID of this transaction.
@@ -76,8 +74,6 @@ class ReadOnlyTransaction : public RowReader {
   const ReadOnlyOptions& options() const { return options_; }
 
  private:
-  absl::Status TryAbort();
-
   mutable absl::Mutex mu_;
   absl::Status status_ ABSL_GUARDED_BY(mu_);
   int active_requests_ ABSL_GUARDED_BY(mu_) = 0;
@@ -93,15 +89,14 @@ class ReadOnlyTransaction : public RowReader {
 
   // Underlying storage of the database.
   Storage* base_storage_;
+  LockManager* lock_manager_;
+  std::unique_ptr<Storage> storage_snapshot_ ABSL_GUARDED_BY(mu_);
 
   // VersionedCatalog for the database provided at transaction creation.
   const VersionedCatalog* const versioned_catalog_;
 
-  // Keeps cursor metadata alive even after this transaction is aborted.
+  // Keeps cursor metadata alive through schema changes.
   std::shared_ptr<const Schema> schema_snapshot_;
-
-  // Transaction lock management.
-  std::unique_ptr<LockHandle> lock_handle_;
 
   // The read timestamp picked by this transaction.
   absl::Time read_timestamp_ = absl::InfinitePast();

@@ -428,9 +428,8 @@ absl::Status Transaction::GuardedCall(OpType op,
     GOOGLESQL_RETURN_IF_ERROR(status_);
   }
 
-  // Pin database ownership across schema resolution, query evaluation, and
-  // streaming. A competing transaction may abort an idle read-only transaction
-  // between requests, but must never change its view during a request.
+  // Keep snapshot resources and schema references valid across evaluation and
+  // streaming. Read-write transactions also retain their database lock.
   const absl::Status call_status =
       type_ == kReadOnly
           ? read_only()->GuardedCall(fn)

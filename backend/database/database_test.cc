@@ -18,21 +18,24 @@
 
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
-#include "googlesql/base/testing/status_matchers.h"
-#include "tests/common/proto_matchers.h"
 #include "absl/status/status.h"
 #include "backend/access/read.h"
 #include "backend/datamodel/key_set.h"
+#include "backend/query/query_engine.h"
 #include "backend/schema/updater/schema_updater.h"
 #include "backend/transaction/options.h"
 #include "common/clock.h"
 #include "common/config.h"
 #include "common/errors.h"
+#include "gmock/gmock.h"
+#include "googlesql/base/testing/status_matchers.h"
+#include "gtest/gtest.h"
+#include "tests/common/proto_matchers.h"
+#include "tests/common/scoped_feature_flags_setter.h"
 
 namespace google {
 namespace spanner {
@@ -188,7 +191,7 @@ TEST_F(DatabaseTest, SchemaSnapshotSurvivesReplacement) {
   EXPECT_TRUE(previous.expired());
 }
 
-TEST_F(DatabaseTest, AbortedReaderKeepsItsSchemaMetadataAlive) {
+TEST_F(DatabaseTest, ReaderKeepsItsSchemaAcrossDdl) {
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       auto db, Database::Create(
                    &clock_, kDatabaseId,
@@ -204,7 +207,7 @@ TEST_F(DatabaseTest, AbortedReaderKeepsItsSchemaMetadataAlive) {
       {.statements = {"DROP TABLE T"}}, &completed_statements, &commit_ts,
       &backfill_status));
   GOOGLESQL_ASSERT_OK(backfill_status);
-  EXPECT_THAT(reader->status(), StatusIs(absl::StatusCode::kAborted));
+  GOOGLESQL_EXPECT_OK(reader->status());
   EXPECT_FALSE(previous.expired());
   EXPECT_NE(reader->schema()->FindTable("T"), nullptr);
   EXPECT_EQ(db->GetLatestSchema()->FindTable("T"), nullptr);
@@ -243,6 +246,134 @@ TEST_F(DatabaseTest, FirstWriteAfterSchemaChangeUsesNewValidators) {
                      {{Int64(2), Int64(-1)}});
   EXPECT_THAT(writer->Write(invalid),
               StatusIs(absl::StatusCode::kOutOfRange));
+}
+
+TEST_F(DatabaseTest, ReadersKeepDataAndIndexesAcrossCommitsAndDdl) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto db, Database::Create(
+                   &clock_, kDatabaseId,
+                   {.statements = {
+                        "CREATE TABLE T (k1 INT64, k2 INT64) PRIMARY KEY (k1)",
+                        "CREATE INDEX I ON T(k2)"}}));
+  auto write = [&](int64_t value) {
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto writer,
+        db->CreateReadWriteTransaction(ReadWriteOptions{}, RetryState{}));
+    Mutation mutation;
+    mutation.AddWriteOp(MutationOpType::kInsertOrUpdate, "T", {"k1", "k2"},
+                        {{Int64(1), Int64(value)}});
+    GOOGLESQL_ASSERT_OK(writer->Write(mutation));
+    GOOGLESQL_ASSERT_OK(writer->Commit());
+  };
+  auto expect_value = [&](ReadOnlyTransaction* reader, int64_t value,
+                          const std::string& index) {
+    auto arg = read_column("T", "k2");
+    arg.index = index;
+    std::unique_ptr<RowCursor> cursor;
+    GOOGLESQL_ASSERT_OK(reader->Read(arg, &cursor));
+    ASSERT_TRUE(cursor->Next());
+    EXPECT_EQ(cursor->ColumnValue(0), Int64(value));
+    EXPECT_FALSE(cursor->Next());
+    GOOGLESQL_EXPECT_OK(cursor->Status());
+  };
+  write(10);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto old, db->CreateReadOnlyTransaction(ReadOnlyOptions{}));
+  write(20);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto current, db->CreateReadOnlyTransaction(ReadOnlyOptions{}));
+  expect_value(old.get(), 10, "");
+  expect_value(old.get(), 10, "I");
+  expect_value(current.get(), 20, "I");
+  absl::Status backfill_status;
+  int completed_statements;
+  absl::Time commit_ts;
+  GOOGLESQL_ASSERT_OK(
+      db->UpdateSchema({.statements = {"DROP INDEX I", "DROP TABLE T"}},
+                       &completed_statements, &commit_ts, &backfill_status));
+  GOOGLESQL_ASSERT_OK(backfill_status);
+  expect_value(old.get(), 10, "");
+  expect_value(old.get(), 10, "I");
+  expect_value(current.get(), 20, "I");
+}
+
+TEST_F(DatabaseTest, ConcurrentSnapshotsNeverObservePartiallyAppliedCommits) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto db,
+      Database::Create(&clock_, kDatabaseId,
+                       {.statements = {"CREATE TABLE T (k1 INT64, k2 INT64) "
+                                       "PRIMARY KEY (k1)"}}));
+  auto write_generation = [&](int64_t generation) {
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto writer,
+        db->CreateReadWriteTransaction(ReadWriteOptions{}, RetryState{}));
+    Mutation mutation;
+    for (int64_t key = 0; key < 64; ++key) {
+      mutation.AddWriteOp(MutationOpType::kInsertOrUpdate, "T", {"k1", "k2"},
+                          {{Int64(key), Int64(generation)}});
+    }
+    GOOGLESQL_ASSERT_OK(writer->Write(mutation));
+    GOOGLESQL_ASSERT_OK(writer->Commit());
+  };
+  write_generation(0);
+  std::thread writer([&] {
+    for (int generation = 1; generation <= 100; ++generation) {
+      write_generation(generation);
+    }
+  });
+  auto check_snapshot = [&] {
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto reader, db->CreateReadOnlyTransaction(ReadOnlyOptions{}));
+    int64_t generation = -1;
+    for (int repeat = 0; repeat < 2; ++repeat) {
+      std::unique_ptr<RowCursor> cursor;
+      GOOGLESQL_ASSERT_OK(reader->Read(read_column("T", "k2"), &cursor));
+      int count = 0;
+      while (cursor->Next()) {
+        const auto value = cursor->ColumnValue(0).int64_value();
+        if (generation < 0) generation = value;
+        EXPECT_EQ(value, generation);
+        ++count;
+      }
+      EXPECT_EQ(count, 64);
+      GOOGLESQL_EXPECT_OK(cursor->Status());
+    }
+  };
+  for (int i = 0; i < 100; ++i) check_snapshot();
+  writer.join();
+}
+
+TEST_F(DatabaseTest, ReaderKeepsTimeZoneFromItsSchema) {
+  test::ScopedEmulatorFeatureFlagsSetter flags(
+      {.enable_default_time_zone = true});
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto db, Database::Create(&clock_, kDatabaseId, SchemaChangeOperation{}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto old, db->CreateReadOnlyTransaction(ReadOnlyOptions{}));
+  absl::Status backfill_status;
+  int completed_statements;
+  absl::Time commit_ts;
+  GOOGLESQL_ASSERT_OK(db->UpdateSchema(
+      {.statements =
+           {"ALTER DATABASE db SET OPTIONS (default_time_zone = 'UTC')"}},
+      &completed_statements, &commit_ts, &backfill_status));
+  GOOGLESQL_ASSERT_OK(backfill_status);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto current, db->CreateReadOnlyTransaction(ReadOnlyOptions{}));
+  auto expect_hour = [&](ReadOnlyTransaction* reader, int64_t hour) {
+    GOOGLESQL_EXPECT_OK(reader->GuardedCall([&]() -> absl::Status {
+      GOOGLESQL_ASSIGN_OR_RETURN(
+          auto result, db->query_engine()->ExecuteSql(
+                           {.sql = "SELECT EXTRACT(HOUR FROM TIMESTAMP "
+                                   "'2000-01-01 00:00:00+00')"},
+                           {.schema = reader->schema(), .reader = reader}));
+      EXPECT_TRUE(result.rows->Next());
+      EXPECT_EQ(result.rows->ColumnValue(0), Int64(hour));
+      return result.rows->Status();
+    }));
+  };
+  expect_hour(old.get(), 16);
+  expect_hour(current.get(), 0);
 }
 
 TEST_F(DatabaseTest, UpdateSchemaPartialSuccess) {

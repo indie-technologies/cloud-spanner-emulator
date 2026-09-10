@@ -31,12 +31,11 @@ namespace backend {
 
 LockHandle::LockHandle(LockManager* manager, TransactionID tid,
                        const std::function<absl::Status()>& abort_fn,
-                       TransactionPriority priority, bool abort_on_contention)
+                       TransactionPriority priority)
     : manager_(manager),
       tid_(tid),
       try_abort_transaction_fn_(abort_fn),
-      priority_(priority),
-      abort_on_contention_(abort_on_contention) {}
+      priority_(priority) {}
 
 LockHandle::~LockHandle() {
   absl::MutexLock lock(mu_);

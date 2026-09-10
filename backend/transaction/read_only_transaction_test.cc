@@ -19,9 +19,8 @@
 #include <memory>
 #include <thread>
 
-#include "gtest/gtest.h"
-#include "googlesql/base/testing/status_matchers.h"
 #include "absl/status/status.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/time.h"
 #include "backend/datamodel/key_range.h"
 #include "backend/locking/manager.h"
@@ -29,6 +28,8 @@
 #include "backend/storage/in_memory_storage.h"
 #include "backend/transaction/options.h"
 #include "common/clock.h"
+#include "googlesql/base/testing/status_matchers.h"
+#include "gtest/gtest.h"
 
 namespace google::spanner::emulator::backend {
 namespace {
@@ -83,115 +84,115 @@ TEST_F(ReadOnlyTransactionTest, RejectsEveryHistoricalTimestampBound) {
   writer->UnlockAll();
 }
 
-TEST_F(ReadOnlyTransactionTest, IdleReaderIsAbortedPermanentlyOnContention) {
-  auto reader = Reader();
-  GOOGLESQL_ASSERT_OK(reader->status());
+TEST_F(ReadOnlyTransactionTest, ReadersAndWriterRemainUsableTogether) {
+  auto first = Reader();
+  auto second = Reader();
   auto writer = Writer();
   Acquire(writer.get());
   GOOGLESQL_ASSERT_OK(writer->Wait());
-  EXPECT_THAT(reader->status(), StatusIs(absl::StatusCode::kAborted));
-  writer->UnlockAll();
-  bool called = false;
-  EXPECT_THAT(reader->GuardedCall([&] {
-    called = true;
-    return absl::OkStatus();
-  }), StatusIs(absl::StatusCode::kAborted));
-  EXPECT_FALSE(called);
-  std::unique_ptr<RowCursor> cursor;
-  EXPECT_THAT(reader->Read(ReadArg{}, &cursor),
-              StatusIs(absl::StatusCode::kAborted));
-}
-
-TEST_F(ReadOnlyTransactionTest, SecondReaderAlsoAbortsIdleReader) {
-  auto first = Reader();
-  auto second = Reader();
+  GOOGLESQL_EXPECT_OK(first->status());
   GOOGLESQL_EXPECT_OK(second->status());
-  EXPECT_THAT(first->status(), StatusIs(absl::StatusCode::kAborted));
-  // Closing the old transaction must not release its successor's lock.
+  GOOGLESQL_EXPECT_OK(first->GuardedCall([] { return absl::OkStatus(); }));
   first->Close();
-  GOOGLESQL_EXPECT_OK(second->GuardedCall([&] {
-    auto writer = Writer();
-    Acquire(writer.get());
-    EXPECT_THAT(writer->Wait(), StatusIs(absl::StatusCode::kAborted));
-    return absl::OkStatus();
-  }));
+  GOOGLESQL_EXPECT_OK(second->GuardedCall([] { return absl::OkStatus(); }));
+  writer->UnlockAll();
 }
 
-TEST_F(ReadOnlyTransactionTest, ActiveRequestExcludesReadersWritersAndDdl) {
+TEST_F(ReadOnlyTransactionTest, ExistingWriterAllowsNewReaders) {
+  auto writer = Writer();
+  Acquire(writer.get());
+  GOOGLESQL_ASSERT_OK(writer->Wait());
   auto reader = Reader();
-  GOOGLESQL_ASSERT_OK(reader->status());
+  GOOGLESQL_EXPECT_OK(reader->status());
+  EXPECT_NE(reader->schema(), nullptr);
+  writer->UnlockAll();
+}
+
+TEST_F(ReadOnlyTransactionTest, ActiveRequestAllowsOtherReadersAndWriter) {
+  auto reader = Reader();
   GOOGLESQL_EXPECT_OK(reader->GuardedCall([&] {
-    // A second thread tries to take ownership while SQL/streaming is active.
     std::thread competitor([&] {
       auto writer = Writer();
       Acquire(writer.get());
-      EXPECT_THAT(writer->Wait(), StatusIs(absl::StatusCode::kAborted));
-      auto other_reader = Reader();
-      EXPECT_THAT(other_reader->status(), StatusIs(absl::StatusCode::kAborted));
+      GOOGLESQL_EXPECT_OK(writer->Wait());
+      auto other = Reader();
+      GOOGLESQL_EXPECT_OK(other->status());
+      GOOGLESQL_EXPECT_OK(other->GuardedCall([] { return absl::OkStatus(); }));
+      writer->UnlockAll();
     });
     competitor.join();
-    // A nested storage Read guard must not prematurely unpin the request.
-    GOOGLESQL_EXPECT_OK(reader->GuardedCall([] { return absl::OkStatus(); }));
-    auto writer = Writer();
-    Acquire(writer.get());
-    EXPECT_THAT(writer->Wait(), StatusIs(absl::StatusCode::kAborted));
     return absl::OkStatus();
   }));
   GOOGLESQL_EXPECT_OK(reader->status());
 }
 
-TEST_F(ReadOnlyTransactionTest, ExistingWriterPreventsReaderInitialization) {
-  auto writer = Writer();
-  Acquire(writer.get());
-  GOOGLESQL_ASSERT_OK(writer->Wait());
-  auto reader = Reader();
-  EXPECT_THAT(reader->status(), StatusIs(absl::StatusCode::kAborted));
-  EXPECT_EQ(reader->schema(), nullptr);
-  writer->UnlockAll();
+TEST_F(ReadOnlyTransactionTest, RegistrationWaitsForCommitPublication) {
+  absl::Notification started;
+  absl::Notification finished;
+  manager_.snapshot_mutex()->Lock();
+  std::thread reader([&] {
+    started.Notify();
+    GOOGLESQL_EXPECT_OK(Reader()->status());
+    finished.Notify();
+  });
+  started.WaitForNotification();
+  EXPECT_FALSE(finished.WaitForNotificationWithTimeout(absl::Milliseconds(20)));
+  manager_.snapshot_mutex()->Unlock();
+  reader.join();
+  EXPECT_TRUE(finished.HasBeenNotified());
 }
 
-TEST_F(ReadOnlyTransactionTest, DestructionAndCloseReleaseDatabaseOwnership) {
-  {
-    auto reader = Reader();
-    GOOGLESQL_ASSERT_OK(reader->status());
-  }
-  auto writer = Writer();
-  Acquire(writer.get());
-  GOOGLESQL_ASSERT_OK(writer->Wait());
-  writer->UnlockAll();
+TEST_F(ReadOnlyTransactionTest, SchemaUpdateWaitsForActiveSqlRequest) {
   auto reader = Reader();
-  reader->Close();
-  EXPECT_FALSE(reader->status().ok());
-  Acquire(writer.get());
-  GOOGLESQL_EXPECT_OK(writer->Wait());
-  writer->UnlockAll();
+  absl::Notification started;
+  absl::Notification finished;
+  std::thread ddl;
+  GOOGLESQL_EXPECT_OK(reader->GuardedCall([&] {
+    ddl = std::thread([&] {
+      started.Notify();
+      absl::MutexLock lock(manager_.schema_mutex());
+      finished.Notify();
+    });
+    started.WaitForNotification();
+    EXPECT_FALSE(
+        finished.WaitForNotificationWithTimeout(absl::Milliseconds(20)));
+    return absl::OkStatus();
+  }));
+  ddl.join();
+  EXPECT_TRUE(finished.HasBeenNotified());
+  GOOGLESQL_EXPECT_OK(reader->status());
 }
 
-TEST_F(ReadOnlyTransactionTest, CloseDuringRequestDefersUnlockUntilRequestEnds) {
+TEST_F(ReadOnlyTransactionTest, ClosePermanentlyRejectsFurtherRequests) {
   auto reader = Reader();
   GOOGLESQL_EXPECT_OK(reader->GuardedCall([&] {
     reader->Close();
     auto writer = Writer();
     Acquire(writer.get());
-    EXPECT_THAT(writer->Wait(), StatusIs(absl::StatusCode::kAborted));
+    GOOGLESQL_EXPECT_OK(writer->Wait());
+    writer->UnlockAll();
     return absl::OkStatus();
   }));
-  auto writer = Writer();
-  Acquire(writer.get());
-  GOOGLESQL_EXPECT_OK(writer->Wait());
-  writer->UnlockAll();
+  EXPECT_FALSE(reader->status().ok());
+  bool called = false;
+  EXPECT_FALSE(reader
+                   ->GuardedCall([&] {
+                     called = true;
+                     return absl::OkStatus();
+                   })
+                   .ok());
+  EXPECT_FALSE(called);
+  std::unique_ptr<RowCursor> cursor;
+  EXPECT_FALSE(reader->Read(ReadArg{}, &cursor).ok());
 }
 
-TEST_F(ReadOnlyTransactionTest, FailedRequestDoesNotLeaveAnUnabortableReader) {
+TEST_F(ReadOnlyTransactionTest, InvalidQueryDoesNotInvalidateSnapshot) {
   auto reader = Reader();
   EXPECT_THAT(reader->GuardedCall([] {
     return absl::InvalidArgumentError("invalid query");
   }), StatusIs(absl::StatusCode::kInvalidArgument));
-  auto writer = Writer();
-  Acquire(writer.get());
-  GOOGLESQL_EXPECT_OK(writer->Wait());
-  EXPECT_THAT(reader->status(), StatusIs(absl::StatusCode::kAborted));
-  writer->UnlockAll();
+  GOOGLESQL_EXPECT_OK(reader->status());
+  GOOGLESQL_EXPECT_OK(reader->GuardedCall([] { return absl::OkStatus(); }));
 }
 
 }  // namespace

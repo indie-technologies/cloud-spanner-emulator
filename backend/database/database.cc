@@ -20,13 +20,12 @@
 #include <thread>  // NOLINT
 #include <utility>
 
-#include "google/spanner/admin/database/v1/common.pb.h"
-#include "googlesql/public/types/type_factory.h"
 #include "absl/functional/bind_front.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/variant.h"
@@ -48,8 +47,9 @@
 #include "backend/transaction/read_write_transaction.h"
 #include "common/clock.h"
 #include "common/errors.h"
+#include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/base/status_macros.h"
-#include "absl/status/status.h"
+#include "googlesql/public/types/type_factory.h"
 
 namespace google {
 namespace spanner {
@@ -162,10 +162,15 @@ absl::Status Database::UpdateSchema(
   }
 
   // Make an exclusive lock request for the database. If there are any
-  // concurrent transactions it will be denied and the operation aborted.
+  // concurrent writers it will be denied and the operation aborted.
   ScopedSchemaChangeLock lock{transaction_id_generator_.NextId(),
                               lock_manager_.get()};
   GOOGLESQL_RETURN_IF_ERROR(lock.Wait());
+
+  // Active SQL requests may use functions referencing the latest schema.
+  // Snapshot registration also needs schema/backfill publication to be atomic.
+  absl::MutexLock schema_lock(lock_manager_->schema_mutex());
+  absl::MutexLock snapshot_lock(lock_manager_->snapshot_mutex());
 
   // Reserve a commit timestamp for the schema changes. Even if the
   // schema change fails, it will result in a no-op commit that will

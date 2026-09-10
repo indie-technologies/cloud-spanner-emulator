@@ -114,7 +114,7 @@ absl::StatusOr<backend::ReadOnlyOptions> ReadOnlyOptionsFromProto(
   if (proto.timestamp_bound_case() != ReadOnly::kStrong &&
       proto.timestamp_bound_case() != ReadOnly::TIMESTAMP_BOUND_NOT_SET) {
     return absl::UnimplementedError(
-        "Only strong reads are supported by this single-version emulator");
+        "Only strong reads are supported by this emulator");
   }
   if (proto.timestamp_bound_case() == ReadOnly::kStrong && !proto.strong()) {
     return error::StrongReadOptionShouldBeTrue();

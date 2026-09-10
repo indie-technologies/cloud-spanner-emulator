@@ -34,7 +34,6 @@
 #include "backend/transaction/resolve.h"
 #include "backend/transaction/row_cursor.h"
 #include "common/clock.h"
-#include "absl/status/status.h"
 
 namespace google {
 namespace spanner {
@@ -49,25 +48,20 @@ ReadOnlyTransaction::ReadOnlyTransaction(
       id_(transaction_id),
       clock_(clock),
       base_storage_(storage),
+      lock_manager_(lock_manager),
       versioned_catalog_(versioned_catalog) {
   absl::MutexLock lock(mu_);
-  lock_handle_ = lock_manager->CreateHandle(
-      transaction_id, [this] { return TryAbort(); }, /*priority=*/1,
-      /*abort_on_contention=*/true);
   if (options.bound != TimestampBound::kStrongRead) {
     status_ = absl::UnimplementedError(
-        "Only strong reads are supported by this single-version emulator");
+        "Only strong reads are supported by this emulator");
     return;
   }
-  lock_handle_->EnqueueLock(
-      LockRequest(LockMode::kShared, "", KeyRange::All(), {}));
-  status_ = lock_handle_->Wait();
-  if (status_.ok()) {
-    // Select the schema and timestamp only after excluding writers and DDL.
-    read_timestamp_ = clock_->Now();
-    schema_snapshot_ = versioned_catalog_->GetLatestSchemaSnapshot();
-    schema_ = schema_snapshot_.get();
-  }
+  absl::MutexLock snapshot_lock(lock_manager_->snapshot_mutex());
+  read_timestamp_ = clock_->Now();
+  base_storage_->CleanUpDeletedTables(read_timestamp_);
+  storage_snapshot_ = base_storage_->CreateSnapshot();
+  schema_snapshot_ = versioned_catalog_->GetLatestSchemaSnapshot();
+  schema_ = schema_snapshot_.get();
 }
 
 ReadOnlyTransaction::~ReadOnlyTransaction() { Close(); }
@@ -80,25 +74,12 @@ absl::Status ReadOnlyTransaction::status() const {
 void ReadOnlyTransaction::Close() {
   absl::MutexLock lock(mu_);
   if (status_.ok()) status_ = error::TransactionClosed(id_);
-  if (active_requests_ == 0) lock_handle_->UnlockAll();
-}
-
-absl::Status ReadOnlyTransaction::TryAbort() {
-  // Called while the lock manager is locked. Never wait for this mutex or
-  // attempt to release the database lock here; the manager hands it over.
-  if (!mu_.try_lock()) return error::CouldNotObtainTransactionMutex(id_);
-  if (active_requests_ != 0) {
-    mu_.unlock();
-    return error::CouldNotObtainTransactionMutex(id_);
-  }
-  status_ = absl::AbortedError(
-      "Read-only transaction aborted by a competing transaction");
-  mu_.unlock();
-  return absl::OkStatus();
+  if (active_requests_ == 0) storage_snapshot_.reset();
 }
 
 absl::Status ReadOnlyTransaction::GuardedCall(
     const std::function<absl::Status()>& fn) {
+  absl::ReaderMutexLock schema_lock(lock_manager_->schema_mutex());
   {
     absl::MutexLock lock(mu_);
     GOOGLESQL_RETURN_IF_ERROR(status_);
@@ -108,35 +89,29 @@ absl::Status ReadOnlyTransaction::GuardedCall(
   {
     absl::MutexLock lock(mu_);
     --active_requests_;
-    if (active_requests_ == 0 && !status_.ok()) lock_handle_->UnlockAll();
+    if (active_requests_ == 0 && !status_.ok()) storage_snapshot_.reset();
   }
   return result;
 }
 
 absl::Status ReadOnlyTransaction::Read(const ReadArg& read_arg,
                                        std::unique_ptr<RowCursor>* cursor) {
-  return GuardedCall([&]() -> absl::Status {
-    auto now = clock_->Now();
-    GOOGLESQL_ASSIGN_OR_RETURN(const ResolvedReadArg resolved_read_arg,
-                     ResolveReadArg(read_arg, schema()));
+  absl::MutexLock lock(mu_);
+  GOOGLESQL_RETURN_IF_ERROR(status_);
+  GOOGLESQL_ASSIGN_OR_RETURN(const ResolvedReadArg resolved_read_arg,
+                             ResolveReadArg(read_arg, schema()));
 
-    // Clean up any dropped tables that are eligible for deletion.
-    // This is inexpensive to do so it can be done for every read.
-    // If there are no tables to clean up, this is a no-op.
-    base_storage_->CleanUpDeletedTables(now);
-
-    std::vector<std::unique_ptr<StorageIterator>> iterators;
-    for (const auto& key_range : resolved_read_arg.key_ranges) {
-      std::unique_ptr<StorageIterator> itr;
-      GOOGLESQL_RETURN_IF_ERROR(base_storage_->Read(
-          read_timestamp_, resolved_read_arg.table->id(), key_range,
-          GetColumnIDs(resolved_read_arg.columns), &itr));
-      iterators.push_back(std::move(itr));
-    }
-    *cursor = std::make_unique<StorageIteratorRowCursor>(
-        std::move(iterators), resolved_read_arg.columns);
-    return absl::OkStatus();
-  });
+  std::vector<std::unique_ptr<StorageIterator>> iterators;
+  for (const auto& key_range : resolved_read_arg.key_ranges) {
+    std::unique_ptr<StorageIterator> itr;
+    GOOGLESQL_RETURN_IF_ERROR(storage_snapshot_->Read(
+        read_timestamp_, resolved_read_arg.table->id(), key_range,
+        GetColumnIDs(resolved_read_arg.columns), &itr));
+    iterators.push_back(std::move(itr));
+  }
+  *cursor = std::make_unique<StorageIteratorRowCursor>(
+      std::move(iterators), resolved_read_arg.columns);
+  return absl::OkStatus();
 }
 
 }  // namespace backend

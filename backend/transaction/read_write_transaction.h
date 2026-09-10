@@ -202,6 +202,7 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
   std::shared_ptr<const Schema> schema_snapshot_;
 
   // Transaction lock management.
+  LockManager* lock_manager_;
   std::unique_ptr<LockHandle> lock_handle_;
 
   // Tracks tables/columns containing pending commit timestamp.

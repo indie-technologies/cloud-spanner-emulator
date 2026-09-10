@@ -16,18 +16,21 @@
 
 #include "backend/storage/in_memory_storage.h"
 
+#include <map>
 #include <memory>
+#include <random>
+#include <thread>
 #include <vector>
 
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
-#include "googlesql/base/testing/status_matchers.h"
-#include "tests/common/proto_matchers.h"
+#include "absl/status/status.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "backend/datamodel/key_range.h"
 #include "backend/storage/iterator.h"
-#include "absl/status/status.h"
+#include "gmock/gmock.h"
+#include "googlesql/base/testing/status_matchers.h"
+#include "gtest/gtest.h"
+#include "tests/common/proto_matchers.h"
 
 namespace google {
 namespace spanner {
@@ -49,6 +52,155 @@ class InMemoryStorageTest : public testing::Test {
   InMemoryStorage storage_;
   std::unique_ptr<StorageIterator> itr_;
 };
+
+TEST_F(InMemoryStorageTest,
+       SnapshotsRetainRowsAcrossUpdatesDeletesAndReinserts) {
+  const auto now = absl::Now();
+  const Key key({Int64(1)});
+  const ColumnID other = "other";
+  GOOGLESQL_ASSERT_OK(storage_.Write(now, kTableId0, key, {kColumnID, other},
+                                     {Int64(10), Int64(20)}));
+  auto first = storage_.CreateSnapshot();
+  GOOGLESQL_ASSERT_OK(
+      storage_.Write(now, kTableId0, key, {kColumnID}, {Int64(30)}));
+  auto second = storage_.CreateSnapshot();
+  GOOGLESQL_ASSERT_OK(storage_.Delete(now, kTableId0, KeyRange::All()));
+  GOOGLESQL_ASSERT_OK(
+      storage_.Write(now, kTableId0, key, {other}, {Int64(40)}));
+  std::vector<googlesql::Value> values;
+  GOOGLESQL_ASSERT_OK(
+      first->Lookup(now, kTableId0, key, {kColumnID, other}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(Int64(10), Int64(20)));
+  GOOGLESQL_ASSERT_OK(
+      second->Lookup(now, kTableId0, key, {kColumnID, other}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(Int64(30), Int64(20)));
+  auto cloned = first->CreateSnapshot();
+  first.reset();
+  GOOGLESQL_ASSERT_OK(
+      cloned->Lookup(now, kTableId0, key, {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(Int64(10)));
+  GOOGLESQL_ASSERT_OK(
+      storage_.Lookup(now, kTableId0, key, {kColumnID, other}, &values));
+  EXPECT_FALSE(values[0].is_valid());
+  EXPECT_EQ(values[1], Int64(40));
+}
+
+TEST_F(InMemoryStorageTest, SnapshotDistinguishesMissingAndEmptyRows) {
+  const auto now = absl::Now();
+  const Key key({Int64(1)});
+  auto missing = storage_.CreateSnapshot();
+  GOOGLESQL_ASSERT_OK(storage_.Write(now, kTableId0, key, {}, {}));
+  auto empty = storage_.CreateSnapshot();
+  GOOGLESQL_ASSERT_OK(
+      storage_.Write(now, kTableId0, key, {kColumnID}, {Int64(1)}));
+  std::vector<googlesql::Value> values;
+  EXPECT_EQ(missing->Lookup(now, kTableId0, key, {}, nullptr).code(),
+            absl::StatusCode::kNotFound);
+  GOOGLESQL_ASSERT_OK(empty->Lookup(now, kTableId0, key, {kColumnID}, &values));
+  ASSERT_EQ(values.size(), 1);
+  EXPECT_FALSE(values[0].is_valid());
+  EXPECT_EQ(empty->Write(now, kTableId0, key, {}, {}).code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(empty->Delete(now, kTableId0, KeyRange::All()).code(),
+            absl::StatusCode::kFailedPrecondition);
+}
+
+TEST_F(InMemoryStorageTest, SnapshotsSurvivePhysicalSchemaCleanup) {
+  const auto now = absl::Now();
+  const Key key({Int64(1)});
+  for (const auto& table : {kTableId0, kTableId1}) {
+    GOOGLESQL_ASSERT_OK(
+        storage_.Write(now, table, key, {kColumnID}, {Int64(7)}));
+  }
+  auto snapshot = storage_.CreateSnapshot();
+  storage_.SetVersionRetentionPeriod(absl::ZeroDuration());
+  storage_.MarkDroppedTable(now, kTableId0);
+  storage_.MarkDroppedColumn(now, kTableId1, kColumnID);
+  storage_.CleanUpDeletedTables(now + absl::Seconds(1));
+  storage_.CleanUpDeletedColumns(now + absl::Seconds(1));
+  for (const auto& table : {kTableId0, kTableId1}) {
+    std::vector<googlesql::Value> values;
+    GOOGLESQL_ASSERT_OK(
+        snapshot->Lookup(now, table, key, {kColumnID}, &values));
+    EXPECT_THAT(values, testing::ElementsAre(Int64(7)));
+    GOOGLESQL_ASSERT_OK(
+        snapshot->Read(now, table, KeyRange::All(), {kColumnID}, &itr_));
+    ASSERT_TRUE(itr_->Next());
+    EXPECT_EQ(itr_->ColumnValue(0), Int64(7));
+    EXPECT_FALSE(itr_->Next());
+  }
+}
+
+TEST_F(InMemoryStorageTest, SnapshotScansMatchIndependentCopiedModels) {
+  const auto now = absl::Now();
+  std::mt19937 random(41627);
+  using Model = std::map<int, int>;
+  Model current;
+  std::vector<std::pair<std::unique_ptr<Storage>, Model>> snapshots;
+  auto check = [&](Storage* storage, const Model& expected, int begin,
+                   int end) {
+    std::unique_ptr<StorageIterator> rows;
+    GOOGLESQL_ASSERT_OK(storage->Read(
+        now, kTableId0,
+        KeyRange::ClosedOpen(Key({Int64(begin)}), Key({Int64(end)})),
+        {kColumnID}, &rows));
+    for (auto it = expected.lower_bound(begin); it != expected.lower_bound(end);
+         ++it) {
+      ASSERT_TRUE(rows->Next());
+      EXPECT_EQ(rows->Key(), Key({Int64(it->first)}));
+      EXPECT_EQ(rows->ColumnValue(0), Int64(it->second));
+    }
+    EXPECT_FALSE(rows->Next());
+  };
+  for (int i = 0; i < 500; ++i) {
+    const int key = random() % 12;
+    switch (random() % 4) {
+      case 0:
+        if (snapshots.size() == 4) snapshots.erase(snapshots.begin());
+        snapshots.emplace_back(storage_.CreateSnapshot(), current);
+        break;
+      case 1: {
+        const int end = key + random() % (13 - key);
+        GOOGLESQL_ASSERT_OK(storage_.Delete(
+            now, kTableId0,
+            KeyRange::ClosedOpen(Key({Int64(key)}), Key({Int64(end)}))));
+        current.erase(current.lower_bound(key), current.lower_bound(end));
+        break;
+      }
+      default:
+        GOOGLESQL_ASSERT_OK(storage_.Write(now, kTableId0, Key({Int64(key)}),
+                                           {kColumnID}, {Int64(i)}));
+        current[key] = i;
+        break;
+    }
+    check(&storage_, current, 0, 12);
+    for (const auto& [snapshot, expected] : snapshots) {
+      check(snapshot.get(), expected, 0, 12);
+      check(snapshot.get(), expected, 3, 9);
+    }
+  }
+}
+
+TEST_F(InMemoryStorageTest, ReadersKeepTheirValuesDuringConcurrentWrites) {
+  const auto now = absl::Now();
+  const Key key({Int64(1)});
+  GOOGLESQL_ASSERT_OK(
+      storage_.Write(now, kTableId0, key, {kColumnID}, {Int64(-1)}));
+  auto snapshot = storage_.CreateSnapshot();
+  std::thread writer([&] {
+    for (int i = 0; i < 2000; ++i) {
+      GOOGLESQL_EXPECT_OK(
+          storage_.Write(now, kTableId0, key, {kColumnID}, {Int64(i)}));
+    }
+  });
+  for (int i = 0; i < 2000; ++i) {
+    std::vector<googlesql::Value> values;
+    GOOGLESQL_EXPECT_OK(
+        snapshot->Lookup(now, kTableId0, key, {kColumnID}, &values));
+    EXPECT_THAT(values, testing::ElementsAre(Int64(-1)));
+  }
+  writer.join();
+}
 
 TEST_F(InMemoryStorageTest, LookupByTable) {
   absl::Time t0 = absl::Now();

@@ -1,6 +1,7 @@
 # Overall performance impact
 
-This page compares the original emulator at `fc811a1a` with the current code,
+The original measurements on this page compare the emulator at `fc811a1a`
+with the performance fork before concurrent reads were restored,
 including all schema graph, transaction, storage, schema lifetime, SQL
 analysis, and query-catalog changes. These are cumulative comparisons, not just
 the latest pass.
@@ -72,9 +73,11 @@ See the [graph benchmark](backend/schema/graph/README.md) and
   owned once per request catalog and borrowed by table/column setup; only
   generated-column analysis copies them to add expression-column bindings.
 
-These changes rely on the new strong-read-only, one-active-transaction-per-
-database contract. The measurements are serial workloads, not concurrent-client
-throughput tests. Contention can cause transaction aborts and retries.
+These measurements used strong reads and one active transaction per database.
+The fork now allows concurrent strong readers with one writer, retaining row
+before-images only while snapshots need them. The measurements below predate
+that restoration and are serial workloads, not concurrent-client throughput
+measurements. Competing writers can still require retries.
 
 There is no single measured whole-test-suite speedup: it depends on how much time
 your tests spend in migrations, SQL analysis, storage, and work outside the

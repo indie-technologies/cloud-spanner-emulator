@@ -39,9 +39,8 @@ namespace backend {
 
 std::unique_ptr<LockHandle> LockManager::CreateHandle(
     TransactionID tid, const std::function<absl::Status()>& abort_fn,
-    TransactionPriority priority, bool abort_on_contention) {
-  return absl::WrapUnique(
-      new LockHandle(this, tid, abort_fn, priority, abort_on_contention));
+    TransactionPriority priority) {
+  return absl::WrapUnique(new LockHandle(this, tid, abort_fn, priority));
 }
 
 void LockManager::EnqueueLock(LockHandle* handle, const LockRequest& request) {
@@ -64,13 +63,11 @@ void LockManager::EnqueueLock(LockHandle* handle, const LockRequest& request) {
   }
 
   // If we reached here, another transaction is already holding the lock.
-  // Idle read-only transactions always yield to a new transaction. Writers
-  // retain the random abort policy so that transactions waiting on each other
-  // can make progress. Active requests can reject the abort in their callback.
+  // Writers retain the random abort policy so that transactions waiting on
+  // each other can make progress. Active requests can reject the abort.
   absl::BitGen gen;
-  if (active_handle_->abort_on_contention_ ||
-      absl::uniform_int_distribution<int>(1, 100)(gen) <=
-          config::abort_current_transaction_probability()) {
+  if (absl::uniform_int_distribution<int>(1, 100)(gen) <=
+      config::abort_current_transaction_probability()) {
     auto could_be_aborted = active_handle_->TryAbortTransaction(
         error::AbortCurrentTransaction(active_handle_->tid(), handle->tid()));
     if (could_be_aborted.ok()) {

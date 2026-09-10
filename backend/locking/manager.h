@@ -35,7 +35,7 @@ namespace backend {
 
 // LockManager represents the lock manager for a database.
 //
-// Transactions interact with the LockManager via a LockHandle which they obtain
+// Writers interact with the LockManager via a LockHandle which they obtain
 // at initialization time. All subsequent communication with the LockManager
 // happens via the LockHandle. See LockHandle methods for more details about
 // this interaction.
@@ -52,10 +52,18 @@ class LockManager {
   // happens via the handle. See LockHandle methods for more details.
   std::unique_ptr<LockHandle> CreateHandle(
       TransactionID id, const std::function<absl::Status()>& abort_fn,
-      TransactionPriority priority, bool abort_on_contention = false);
+      TransactionPriority priority);
 
   // Returns the timestamp at which last schema update or commit completed.
   absl::Time LastCommitTimestamp();
+
+  // Snapshot registration must see an entire committed batch and its schema.
+  // Existing snapshots can keep reading while this mutex is held.
+  absl::Mutex* snapshot_mutex() { return &snapshot_mu_; }
+
+  // SQL functions may reference the latest schema. DDL takes the writer lock;
+  // read-only SQL/streaming requests take the reader lock, not whole snapshots.
+  absl::Mutex* schema_mutex() { return &schema_mu_; }
 
  private:
   // LockHandle simply forwards requests to the LockManager.
@@ -71,7 +79,10 @@ class LockManager {
   // Mutex to guard state below.
   absl::Mutex mu_;
 
-  // The currently active transaction (only one transaction can be active).
+  absl::Mutex snapshot_mu_;
+  absl::Mutex schema_mu_;
+
+  // The currently active writer (read snapshots do not acquire this lock).
   LockHandle* active_handle_ ABSL_GUARDED_BY(mu_) = nullptr;
 
   // System wide monotonic clock used to provide commit and read timestamps.

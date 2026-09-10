@@ -243,6 +243,7 @@ ReadWriteTransaction::ReadWriteTransaction(
       clock_(clock),
       base_storage_(storage),
       versioned_catalog_(versioned_catalog),
+      lock_manager_(lock_manager),
       lock_handle_(lock_manager->CreateHandle(
           transaction_id, [&]() -> absl::Status { return TryAbort(); },
           retry_state_.priority)),
@@ -666,6 +667,9 @@ absl::Status ReadWriteTransaction::Commit() {
     GOOGLESQL_ASSIGN_OR_RETURN(
         std::unique_ptr<postgres_translator::interfaces::PGArena> arena,
         postgres_translator::spangres::MemoryContextPGArena::Init(nullptr));
+
+    // A new snapshot must not register part way through applying this batch.
+    absl::MutexLock snapshot_lock(lock_manager_->snapshot_mutex());
 
     // Pick a commit timestamp.
     GOOGLESQL_ASSIGN_OR_RETURN(commit_timestamp_, lock_handle_->ReserveCommitTimestamp());

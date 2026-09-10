@@ -1168,10 +1168,10 @@ absl::StatusOr<std::string> QueryEngine::GetDmlTargetTable(
     const Query& query, const Schema* schema) const {
   Query normalized_query;
   NormalizeParameterNames(schema, query, &normalized_query);
-  GOOGLESQL_ASSIGN_OR_RETURN(auto analyzer_options,
-                   MakeAnalyzerOptionsWithParameters(
-                       normalized_query.declared_params,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+  GOOGLESQL_ASSIGN_OR_RETURN(
+      auto analyzer_options,
+      MakeAnalyzerOptionsWithParameters(normalized_query.declared_params,
+                                        GetTimeZone(schema)));
   analyzer_options.set_prune_unused_columns(true);
   Catalog catalog(schema, &function_catalog_, type_factory_, analyzer_options);
   GOOGLESQL_ASSIGN_OR_RETURN(
@@ -1247,8 +1247,7 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteInsertOnConflictDml(
           auto insert_or_update_result,
           EvaluateUpdate(insert_or_update_stmt.get(), &catalog, params,
                          type_factory_, context.schema->dialect(),
-                         context.schema,
-                         GetTimeZone(function_catalog_.GetLatestSchema())));
+                         context.schema, GetTimeZone(context.schema)));
       GOOGLESQL_RETURN_IF_ERROR(context.writer->Write(insert_or_update_result.mutation));
       result.modified_row_count = insert_or_update_result.modify_row_count;
       result.rows = std::move(insert_or_update_result.returning_row_cursor);
@@ -1276,7 +1275,7 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteInsertOnConflictDml(
       auto insert_or_ignore_result,
       EvaluateUpdate(insert_or_ignore_stmt.get(), &catalog, params,
                      type_factory_, context.schema->dialect(), context.schema,
-                     GetTimeZone(function_catalog_.GetLatestSchema()),
+                     GetTimeZone(context.schema),
                      /*return_all_insert_rows_insert_ignore_dml=*/true));
 
   // 4. Get all table rows keys. The key columns are the conflict target key
@@ -1313,7 +1312,7 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteInsertOnConflictDml(
         auto insert_stmt_execute_update_result,
         EvaluateUpdate(insert_new_rows_stmt.get(), &catalog, params,
                        type_factory_, context.schema->dialect(), context.schema,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+                       GetTimeZone(context.schema)));
 
     GOOGLESQL_RETURN_IF_ERROR(
         context.writer->Write(insert_stmt_execute_update_result.mutation));
@@ -1340,8 +1339,7 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteInsertOnConflictDml(
         auto update_stmt_execute_update_result,
         EvaluateUpdate(update_existing_rows_resolved_stmt.get(), &catalog,
                        params, type_factory_, context.schema->dialect(),
-                       context.schema,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+                       context.schema, GetTimeZone(context.schema)));
     GOOGLESQL_RETURN_IF_ERROR(
         context.writer->Write(update_stmt_execute_update_result.mutation));
     result.modified_row_count +=
@@ -1376,10 +1374,10 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
 
   Query normalized_query;
   NormalizeParameterNames(context.schema, query, &normalized_query);
-  GOOGLESQL_ASSIGN_OR_RETURN(auto analyzer_options,
-                   MakeAnalyzerOptionsWithParameters(
-                       normalized_query.declared_params,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+  GOOGLESQL_ASSIGN_OR_RETURN(
+      auto analyzer_options,
+      MakeAnalyzerOptionsWithParameters(normalized_query.declared_params,
+                                        GetTimeZone(context.schema)));
   // DML needs every target column. Analyze it without pruning from the start
   // instead of analyzing, validating, and cloning the same statement twice.
   analyzer_options.set_prune_unused_columns(!is_dml);
@@ -1455,10 +1453,9 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
   QueryResult result;
   if (!IsDMLStmt(analyzer_output->resolved_statement()->node_kind())) {
     GOOGLESQL_ASSIGN_OR_RETURN(
-        auto cursor,
-        EvaluateQuery(resolved_statement.get(), params, type_factory_,
-                      &result.num_output_rows, query_mode,
-                      GetTimeZone(function_catalog_.GetLatestSchema())));
+        auto cursor, EvaluateQuery(resolved_statement.get(), params,
+                                   type_factory_, &result.num_output_rows,
+                                   query_mode, GetTimeZone(context.schema)));
     result.rows = std::move(cursor);
   } else {
     GOOGLESQL_RET_CHECK_NE(context.writer, nullptr);
@@ -1494,8 +1491,7 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
             auto execute_update_result,
             EvaluateUpdate(resolved_statement.get(), catalog.get(), params,
                            type_factory_, context.schema->dialect(),
-                           context.schema,
-                           GetTimeZone(function_catalog_.GetLatestSchema())));
+                           context.schema, GetTimeZone(context.schema)));
         GOOGLESQL_RETURN_IF_ERROR(context.writer->Write(execute_update_result.mutation));
         result.modified_row_count = execute_update_result.modify_row_count;
         result.rows = std::move(execute_update_result.returning_row_cursor);
@@ -1568,10 +1564,10 @@ absl::Status QueryEngine::IsPartitionable(const Query& query,
                                           const QueryContext& context) const {
   Query local_query;
   NormalizeParameterNames(context.schema, query, &local_query);
-  GOOGLESQL_ASSIGN_OR_RETURN(auto analyzer_options,
-                   MakeAnalyzerOptionsWithParameters(
-                       local_query.declared_params,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+  GOOGLESQL_ASSIGN_OR_RETURN(
+      auto analyzer_options,
+      MakeAnalyzerOptionsWithParameters(local_query.declared_params,
+                                        GetTimeZone(context.schema)));
   analyzer_options.set_prune_unused_columns(true);
   Catalog catalog{context.schema, &function_catalog_, type_factory_,
                   analyzer_options};
@@ -1609,10 +1605,10 @@ absl::Status QueryEngine::IsValidPartitionedDML(
 
   Query local_query;
   NormalizeParameterNames(context.schema, query, &local_query);
-  GOOGLESQL_ASSIGN_OR_RETURN(auto analyzer_options,
-                   MakeAnalyzerOptionsWithParameters(
-                       local_query.declared_params,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+  GOOGLESQL_ASSIGN_OR_RETURN(
+      auto analyzer_options,
+      MakeAnalyzerOptionsWithParameters(local_query.declared_params,
+                                        GetTimeZone(context.schema)));
   analyzer_options.set_prune_unused_columns(true);
   Catalog catalog{context.schema, &function_catalog_, type_factory_,
                   analyzer_options};

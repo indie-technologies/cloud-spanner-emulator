@@ -82,7 +82,7 @@ INSTANTIATE_TEST_SUITE_P(SessionTypes, TransactionApiTest,
                          testing::Values(SessionType::kRegularSession,
                                          SessionType::kMultiplexedSession));
 
-TEST_P(TransactionApiTest, IdleReadOnlyTransactionCannotResumeAfterWriter) {
+TEST_P(TransactionApiTest, IdleReadOnlyTransactionSurvivesWriter) {
   const auto session =
       GetSessionUri(GetSessionType() == SessionType::kMultiplexedSession);
   spanner_api::BeginTransactionRequest begin;
@@ -94,15 +94,23 @@ TEST_P(TransactionApiTest, IdleReadOnlyTransactionCannotResumeAfterWriter) {
   spanner_api::ExecuteSqlRequest query;
   query.set_session(session);
   query.mutable_transaction()->set_id(reader.id());
-  query.set_sql("SELECT 1");
+  query.set_sql("SELECT int64_col FROM test_table WHERE int64_col = 12345");
   spanner_api::ResultSet rows;
   GOOGLESQL_ASSERT_OK(ExecuteSql(query, &rows));
+  EXPECT_EQ(rows.rows_size(), 0);
 
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto writer_session,
                                CreateTestSession(/*multiplexed=*/false));
   spanner_api::CommitRequest commit;
   commit.set_session(writer_session);
   commit.mutable_single_use_transaction()->mutable_read_write();
+  *commit.add_mutations() = PARSE_TEXT_PROTO(R"pb(
+    insert {
+      table: "test_table"
+      columns: "int64_col"
+      values { values { string_value: "12345" } }
+    }
+  )pb");
   spanner_api::CommitResponse response;
   GOOGLESQL_ASSERT_OK(Commit(commit, &response));
 
@@ -110,22 +118,25 @@ TEST_P(TransactionApiTest, IdleReadOnlyTransactionCannotResumeAfterWriter) {
   partition_read.set_session(session);
   partition_read.mutable_transaction()->set_id(reader.id());
   partition_read.set_table("test_table");
+  partition_read.add_columns("int64_col");
   partition_read.mutable_key_set()->set_all(true);
   spanner_api::PartitionResponse partitions;
-  EXPECT_THAT(PartitionRead(partition_read, &partitions),
-              StatusIs(absl::StatusCode::kAborted));
+  GOOGLESQL_EXPECT_OK(PartitionRead(partition_read, &partitions));
   spanner_api::PartitionQueryRequest partition_query;
   partition_query.set_session(session);
   partition_query.mutable_transaction()->set_id(reader.id());
-  partition_query.set_sql("SELECT 1");
+  partition_query.set_sql("SELECT int64_col FROM test_table");
   grpc::ClientContext partition_context;
-  EXPECT_THAT(test_env()->spanner_client()->PartitionQuery(
-                  &partition_context, partition_query, &partitions),
-              StatusIs(absl::StatusCode::kAborted));
+  GOOGLESQL_EXPECT_OK(test_env()->spanner_client()->PartitionQuery(
+      &partition_context, partition_query, &partitions));
 
-  // Even a constant query must reject the old transaction, rather than silently
-  // changing its snapshot or bypassing the lock through a query without reads.
-  EXPECT_THAT(ExecuteSql(query, &rows), StatusIs(absl::StatusCode::kAborted));
+  GOOGLESQL_EXPECT_OK(ExecuteSql(query, &rows));
+  EXPECT_EQ(rows.rows_size(), 0);
+  query.mutable_transaction()->clear_id();
+  query.mutable_transaction()->mutable_single_use()->mutable_read_only();
+  GOOGLESQL_ASSERT_OK(ExecuteSql(query, &rows));
+  ASSERT_EQ(rows.rows_size(), 1);
+  EXPECT_EQ(rows.rows(0).values(0).string_value(), "12345");
 }
 
 TEST_P(TransactionApiTest, SingleUseReadReleasesOwnershipAfterRequest) {
@@ -781,8 +792,7 @@ TEST_P(TransactionApiTest, CommitMultiplexedSessionIsolation) {
   EXPECT_FALSE(commit_response1.has_commit_timestamp());
 
   // 2. Read from a DIFFERENT transaction/session (Single Use).
-  //    Contention aborts either the reader or the idle writer. Uncommitted
-  //    values must never become visible in either case.
+  //    Uncommitted values remain private without aborting the reader.
   spanner_api::ReadRequest read_request = PARSE_TEXT_PROTO(R"pb(
     table: "test_table"
     columns: "string_col"
@@ -791,7 +801,7 @@ TEST_P(TransactionApiTest, CommitMultiplexedSessionIsolation) {
   read_request.set_session(GetSessionUri(true));
   spanner_api::ResultSet read_response;
   const auto read_status = Read(read_request, &read_response);
-  EXPECT_TRUE(read_status.ok() || absl::IsAborted(read_status)) << read_status;
+  GOOGLESQL_EXPECT_OK(read_status);
   EXPECT_EQ(read_response.rows_size(), 0);
 
   spanner_api::RollbackRequest rollback;

@@ -12,22 +12,23 @@ targeting Cloud Spanner.
 
 ## Transaction and storage behavior in this fork
 
-This fork uses single-version row storage and permits one active database
-transaction at a time, including read-only transactions and schema changes.
-Only strong reads are supported; explicit historical timestamps and staleness
-bounds are rejected. These changes apply to binaries built from this source,
+This fork permits concurrent strong read-only transactions alongside one
+read-write transaction. Explicit historical timestamps and staleness bounds
+remain unsupported. These changes apply to binaries built from this source,
 not the upstream prebuilt images linked below.
 
-An idle reusable read-only transaction is aborted when another transaction needs
-the database. Reusing its ID returns `ABORTED`; callers must start a new
-transaction and retry the entire read operation. A query or result stream in
-progress cannot be preempted. Single-use reads release ownership when their
-request finishes; session cleanup also releases ownership. Change streams use
-short strong reads between waits and retain their history as ordinary rows.
-Read-write transactions retain their existing write buffers, commit timestamps,
-and rollback behavior.
+Each reader pins its committed data and schema when it starts. Writers continue
+to buffer mutations until commit, and readers never see a partially applied
+commit. Existing readers remain valid across commits and schema changes. Active
+SQL requests exclude schema updates while evaluating schema-dependent
+functions; idle readers do not block migrations. Change streams use short strong
+reads between waits and retain their history as ordinary rows.
 
-Rows store only their current values, and deleting a row removes it from storage.
+Rows normally store only their current values. When a write overlaps an active
+reader, storage preserves that row's original value once for that snapshot.
+Closing the reader releases these before-images. There is no time-based row
+history or whole-database copy, but long-lived readers overlapping many writes
+can retain proportionally more memory.
 Storage timestamps no longer select historical data. The schema catalog retains
 only the current schema and snapshots still referenced by a transaction or admin
 request. Write validators are built on the first write after a schema change.
@@ -224,7 +225,7 @@ Notable limitations:
   are not supported.
 
 - The emulator only allows one read-write transaction or schema change at a
-  time. Any concurrent transaction will be aborted. Transactions should always
+  time. Competing writers can be aborted; read-only transactions can overlap. Transactions should always
   be wrapped in a retry loop. This [recommendation](
   https://cloud.google.com/spanner/docs/transactions) applies to the Cloud
   Spanner service as well.
