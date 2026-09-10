@@ -150,6 +150,7 @@ cc_library(
 )
 cc_test(
     name = "persistence_test",
+    linkstatic = True,
     srcs = ["persistence_test.cc"],
     deps = [
         ":persistence",

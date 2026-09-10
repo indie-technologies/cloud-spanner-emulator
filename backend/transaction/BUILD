@@ -86,6 +86,7 @@ cc_library(
 
 cc_test(
     name = "read_write_transaction_test",
+    linkstatic = True,
     srcs = [
         "read_write_transaction_test.cc",
     ],
@@ -274,6 +275,7 @@ cc_library(
 
 cc_test(
     name = "read_only_transaction_test",
+    linkstatic = True,
     srcs = [
         "read_only_transaction_test.cc",
     ],

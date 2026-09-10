@@ -77,6 +77,7 @@ cc_library(
 
 cc_test(
     name = "in_memory_storage_test",
+    linkstatic = True,
     srcs = [
         "in_memory_storage_test.cc",
     ],

@@ -1,0 +1,54 @@
+name: Build and release emulator
+on:
+  pull_request:
+  push:
+    tags: ['v*-found*']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compiler and Java
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-13 gcc-13 openjdk-21-jdk-headless python3 zip unzip locales
+          sudo locale-gen en_US.UTF-8
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ runner.os }}-amd64-release
+          repository-cache: true
+      - name: Build and test
+        env:
+          CC: gcc-13
+          CXX: g++-13
+          BUILD_JOBS: '16'
+          BUILD_MEMORY_MB: '80000'
+        run: build/release/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64
+          path: dist/*
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: dist
+      - name: Publish immutable release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* --verify-tag \
+            --title "$RELEASE_TAG" --notes "Native Linux amd64 emulator at $SOURCE_REVISION. Includes performance improvements, concurrent strong readers, and optional development persistence."

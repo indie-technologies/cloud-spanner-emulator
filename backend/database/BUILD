@@ -71,6 +71,7 @@ cc_library(
 
 cc_test(
     name = "database_test",
+    linkstatic = True,
     srcs = [
         "database_test.cc",
     ],
@@ -96,6 +97,7 @@ cc_test(
 
 cc_test(
     name = "snapshot_test",
+    linkstatic = True,
     srcs = ["snapshot_test.cc"],
     deps = [
         ":database",

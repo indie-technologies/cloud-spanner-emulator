@@ -58,6 +58,7 @@ cc_library(
 
 cc_test(
     name = "change_stream_partition_churner_test",
+    linkstatic = True,
     size = "small",
     srcs = [
         "change_stream_partition_churner_test.cc",
