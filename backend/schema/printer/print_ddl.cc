@@ -942,7 +942,7 @@ std::string PrintLocalityGroupOptions(
 }
 
 absl::StatusOr<std::vector<std::string>> PrintDDLStatements(
-    const Schema* schema) {
+    const Schema* schema, bool include_database_options) {
   std::vector<std::string> statements;
   if (schema->dialect() == database_api::DatabaseDialect::POSTGRESQL) {
     absl::StatusOr<std::unique_ptr<SpangresSchemaPrinter>> printer =
@@ -950,6 +950,7 @@ absl::StatusOr<std::vector<std::string>> PrintDDLStatements(
     GOOGLESQL_RETURN_IF_ERROR(printer.status());
     ddl::DDLStatementList ddl_statements = schema->Dump();
     for (const ddl::DDLStatement& statement : ddl_statements.statement()) {
+      if (!include_database_options && statement.has_alter_database()) continue;
       absl::StatusOr<std::vector<std::string>> printed_statements =
           (*printer)->PrintDDLStatementForEmulator(statement);
       GOOGLESQL_RETURN_IF_ERROR(printed_statements.status());
@@ -961,7 +962,7 @@ absl::StatusOr<std::vector<std::string>> PrintDDLStatements(
 
   // Print database options.
   const DatabaseOptions* options = schema->options();
-  if (options != nullptr) {
+  if (options != nullptr && include_database_options) {
     for (const auto& option : options->options()) {
       std::string option_name = option.option_name();
       statements.push_back(absl::Substitute(

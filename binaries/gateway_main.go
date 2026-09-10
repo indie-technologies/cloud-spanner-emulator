@@ -28,11 +28,14 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"cloud_spanner_emulator/gateway"
 )
 
 var (
+	stateFile          = flag.String("state_file", "", "Optional development snapshot file.")
+	checkpointInterval = flag.Duration("checkpoint_interval", 60*time.Second, "Checkpoint interval when state_file is set.")
 	// Networking related flags.
 	hostname = flag.String("hostname", "localhost", "Hostname for the emulator servers.")
 	grpcPort = flag.Int("grpc_port", 9010, "Port on which to run the emulator grpc server.")
@@ -102,7 +105,6 @@ func resolveGRPCBinary() string {
 	return retval
 }
 
-
 func main() {
 	flag.Parse()
 
@@ -152,10 +154,11 @@ func main() {
 		}
 	}
 
-
 	// Start the gateway http server. This will run the emulator grpc server as a subprocess and
 	// proxy http/json requests into grpc requests.
 	gwopts := gateway.Options{
+		StateFile:                          *stateFile,
+		CheckpointInterval:                 *checkpointInterval,
 		GatewayAddress:                     fmt.Sprintf("%s:%d", *hostname, *httpPort),
 		FrontendBinary:                     resolveGRPCBinary(),
 		FrontendAddress:                    fmt.Sprintf("%s:%d", *hostname, *grpcPort),

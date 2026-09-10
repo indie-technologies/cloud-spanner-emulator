@@ -30,6 +30,7 @@
 #include "absl/types/variant.h"
 #include "backend/actions/manager.h"
 #include "backend/common/ids.h"
+#include "backend/persistence/snapshot.pb.h"
 #include "backend/database/change_stream/change_stream_partition_churner.h"
 #include "backend/database/pg_oid_assigner/pg_oid_assigner.h"
 #include "backend/locking/manager.h"
@@ -62,7 +63,33 @@ class Database {
   // failed to create the database.
   static absl::StatusOr<std::unique_ptr<Database>> Create(
       Clock* clock, std::string_view database_id,
-      const SchemaChangeOperation& schema_change_operation);
+      const SchemaChangeOperation& schema_change_operation,
+      bool start_background_tasks = true);
+
+  ~Database();
+
+  struct PersistenceVersion {
+    uint64_t schema_revision;
+    uint64_t storage_revision;
+    std::vector<int64_t> sequence_counters;
+    bool operator==(const PersistenceVersion&) const = default;
+  };
+  // Lightweight dirty check, including nontransactional sequence allocations.
+  PersistenceVersion GetPersistenceVersion() const;
+
+  struct Snapshot {
+    // The database must outlive this view (as with read-only transactions).
+    std::shared_ptr<const Schema> schema;
+    std::unique_ptr<Storage> storage;
+    std::vector<persistence::Sequence> sequences;
+    absl::Status Serialize(persistence::Database* out) const;
+  };
+  Snapshot CaptureSnapshot();
+  static absl::StatusOr<std::unique_ptr<Database>> Restore(
+      Clock* clock, std::string_view database_id,
+      const persistence::Database& snapshot);
+  void StartBackgroundTasks();
+  void StopBackgroundTasks();
 
   // Creates a read only transaction attached to this database.
   absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
@@ -124,6 +151,8 @@ class Database {
 
  private:
   Database();
+  uint64_t schema_revision_ = 0;  // Guarded by snapshot_mutex().
+  bool background_tasks_enabled_ = true;
   // Delete copy and assignment operators since database shouldn't be copyable.
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;

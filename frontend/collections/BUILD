@@ -166,6 +166,7 @@ cc_library(
         "instance_manager.h",
     ],
     deps = [
+        "//frontend/converters:time",
         "//common:errors",
         "//frontend/common:labels",
         "//frontend/entities:instance",
@@ -187,6 +188,7 @@ cc_library(
         "instance_partition_manager.h",
     ],
     deps = [
+        "//frontend/converters:time",
         "//common:errors",
         "//frontend/entities:instance_partition",
         "@com_google_absl//absl/base:core_headers",

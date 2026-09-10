@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	// We need this to make sure that the gateway can serialize the google.rpc.ErrorInfo proto.
@@ -38,12 +39,14 @@ import (
 	instancepb "cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	lrgw "cloud_spanner_emulator/gateway/longrunning_operations_gateway"
 	dagw "cloud_spanner_emulator/gateway/spanner_admin_database_gateway"
-	spgw "cloud_spanner_emulator/gateway/spanner_gateway"
 	iagw "cloud_spanner_emulator/gateway/spanner_admin_instance_gateway"
+	spgw "cloud_spanner_emulator/gateway/spanner_gateway"
 )
 
 // Options encapsulates options for the emulator gateway.
 type Options struct {
+	StateFile                                      string
+	CheckpointInterval                             time.Duration
 	GatewayAddress                                 string
 	FrontendBinary                                 string
 	FrontendAddress                                string
@@ -73,6 +76,13 @@ func (gw *Gateway) Run() {
 	emulatorArgs := []string{
 		"--host_port", gw.opts.FrontendAddress,
 	}
+	if gw.opts.StateFile != "" {
+		if gw.opts.CheckpointInterval <= 0 {
+			log.Fatal("checkpoint_interval must be greater than zero")
+		}
+		emulatorArgs = append(emulatorArgs, "--state_file="+gw.opts.StateFile,
+			"--checkpoint_interval="+gw.opts.CheckpointInterval.String())
+	}
 	if gw.opts.LogRequests {
 		emulatorArgs = append(emulatorArgs, "--log_requests")
 	}
@@ -96,7 +106,6 @@ func (gw *Gateway) Run() {
 		fmt.Sprintf("--override_change_stream_partition_token_alive_seconds=%d",
 			gw.opts.OverrideChangeStreamPartitionTokenAliveSeconds))
 
-
 	cmd := exec.Command(gw.opts.FrontendBinary, emulatorArgs...)
 
 	// Proxy emulator log to gateway log.
@@ -107,23 +116,23 @@ func (gw *Gateway) Run() {
 		cmd.Stderr = os.Stderr
 	}
 
+	// Register before starting the child, so an early stop cannot orphan it.
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
 	// Start the grpc server but won't block for the grpc server to be up.
 	err := cmd.Start()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Terminate the grpc server if the gateway server is terminated.
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
+	// Forward both terminal interrupts and Docker/PID 1 termination. The child
+	// drains requests and saves before exiting; cmd.Wait below reaps it and
+	// propagates checkpoint failures through the gateway's exit status.
 	go func() {
-		<-c
-		// Release resources e.g., network ports associated with the process.
-		// This is required since gateway may receive an interrupt signal for
-		// shutdown before Wait() returns.
-		cmd.Process.Release()
-		cmd.Process.Kill()
-		os.Exit(0)
+		for sig := range c {
+			_ = cmd.Process.Signal(sig)
+		}
 	}()
 
 	// Terminate the gateway server if the grpc server is terminated.
@@ -132,7 +141,6 @@ func (gw *Gateway) Run() {
 		log.Println("Shutting down gateway server since grpc server is terminated.")
 		os.Exit(cmd.ProcessState.ExitCode())
 	}()
-
 
 	// Wait for the grpc server to be up.
 	ctx := context.Background()
@@ -172,17 +180,17 @@ func (gw *Gateway) Run() {
 	}
 }
 
-
 func waitForReady(ctx context.Context, endpoint string) error {
 	timeout := 30 * time.Second
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	conn, err := grpc.Dial(endpoint, grpc.WithInsecure(), grpc.WithBlock())
+	// Restoring a development database can take longer than 30 seconds. The
+	// child-exit watcher handles startup failure while we wait for it to listen.
+	conn, err := grpc.DialContext(ctx, endpoint, grpc.WithInsecure(), grpc.WithBlock())
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	// To test whether the server is up, wait for ListInstanceConfigs to respond
 	// for a dummy project.

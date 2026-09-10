@@ -27,6 +27,8 @@
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "common/errors.h"
+#include "frontend/converters/time.h"
+#include "googlesql/base/status_macros.h"
 #include "frontend/entities/instance_partition.h"
 
 namespace google {
@@ -97,13 +99,22 @@ InstancePartitionManager::CreateInstancePartition(
   if (!inserted.second) {
     return error::InstancePartitionAlreadyExists(partition_uri);
   }
+  ++revision_;
   return inserted.first->second;
 }
 
 void InstancePartitionManager::DeleteInstancePartition(
     const std::string& partition_uri) {
   absl::MutexLock lock(mu_);
-  partitions_.erase(partition_uri);
+  if (partitions_.erase(partition_uri)) ++revision_;
+}
+
+absl::Status InstancePartitionManager::Restore(const instance_api::InstancePartition& proto) {
+  GOOGLESQL_ASSIGN_OR_RETURN(auto created, TimestampFromProto(proto.create_time()));
+  GOOGLESQL_ASSIGN_OR_RETURN(auto updated, TimestampFromProto(proto.update_time()));
+  GOOGLESQL_ASSIGN_OR_RETURN(auto entity, CreateInstancePartition(proto.name(), proto));
+  entity->RestoreTimestamps(created, updated);
+  return absl::OkStatus();
 }
 
 }  // namespace frontend

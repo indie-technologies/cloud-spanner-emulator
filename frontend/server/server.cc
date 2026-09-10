@@ -16,6 +16,7 @@
 
 #include "frontend/server/server.h"
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <utility>
@@ -317,6 +318,20 @@ Server::Server(std::unique_ptr<ServerEnv> env)
 std::unique_ptr<Server> Server::Create(const Server::Options& options) {
   auto env = std::make_unique<ServerEnv>();
   std::unique_ptr<Server> server = absl::WrapUnique(new Server(std::move(env)));
+  if (!options.state_file.empty()) {
+    if (options.checkpoint_interval <= absl::ZeroDuration() ||
+        options.checkpoint_interval == absl::InfiniteDuration()) {
+      ABSL_LOG(ERROR) << "checkpoint_interval must be finite and greater than zero";
+      return nullptr;
+    }
+    auto state = Persistence::Open(server->env_.get(), options.state_file);
+    if (!state.ok()) {
+      ABSL_LOG(ERROR) << "Cannot restore state file '" << options.state_file
+                      << "': " << state.status();
+      return nullptr;
+    }
+    server->persistence_ = std::move(*state);
+  }
   ::grpc::ServerBuilder builder;
 
   // Configure server address.
@@ -337,19 +352,42 @@ std::unique_ptr<Server> Server::Create(const Server::Options& options) {
       .RegisterService(server->instance_admin_service_.get())
       .RegisterService(server->operations_service_.get());
 
+  // Start restored background work before requests can race with initialization.
+  if (server->persistence_) {
+    for (auto& db : server->env_->database_manager()->Capture().entries) {
+      db->backend()->StartBackgroundTasks();
+    }
+  }
+
   // Actually start the server.
   server->grpc_server_ = builder.BuildAndStart();
-  if (server->port_ < 0) {
+  if (!server->grpc_server_ || server->port_ <= 0) {
     ABSL_LOG(ERROR) << "Failed to bind to address: " << options.server_address;
     return nullptr;
   }
 
+  if (server->persistence_) {
+    server->persistence_->Start(options.checkpoint_interval);
+  }
   return server;
 }
 
 void Server::WaitForShutdown() { grpc_server_->Wait(); }
 
-void Server::Shutdown() { grpc_server_->Shutdown(); }
+absl::Status Server::Shutdown() {
+  // Bound draining of long-lived streaming RPCs, then wait for handlers to stop
+  // before the final checkpoint. Buffered transactions never reach storage.
+  grpc_server_->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  grpc_server_->Wait();
+  if (persistence_) {
+    persistence_->Stop();
+    for (auto& db : env_->database_manager()->Capture().entries) {
+      db->backend()->StopBackgroundTasks();
+    }
+    return persistence_->Checkpoint().status();
+  }
+  return absl::OkStatus();
+}
 
 }  // namespace frontend
 }  // namespace emulator

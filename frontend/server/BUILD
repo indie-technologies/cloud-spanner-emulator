@@ -16,6 +16,7 @@
 
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 
 package(
     default_visibility = ["//:__subpackages__"],
@@ -93,6 +94,7 @@ cc_library(
     ],
     deps = [
         ":environment",
+        ":persistence",
         ":handler",
         ":request_context",
         "//common:constants",
@@ -128,5 +130,43 @@ cc_library(
         "//frontend/collections:operation_manager",
         "//frontend/collections:session_manager",
         "@com_github_grpc_grpc//:grpc++",
+    ],
+)
+
+cc_library(
+    name = "persistence",
+    srcs = ["persistence.cc"],
+    hdrs = ["persistence.h"],
+    deps = [
+        ":environment",
+        "//backend/persistence:files",
+        "//frontend/common:uris",
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_googlesql//googlesql/base:status",
+    ],
+)
+cc_test(
+    name = "persistence_test",
+    srcs = ["persistence_test.cc"],
+    deps = [
+        ":persistence",
+        ":server",
+        "//backend/persistence:files",
+        "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+cc_binary(
+    name = "persistence_benchmark",
+    testonly = True,
+    srcs = ["persistence_benchmark.cc"],
+    deps = [
+        ":persistence",
+        "//backend/persistence:files",
+        "@com_github_google_benchmark//:benchmark",
+        "@com_google_googlesql//googlesql/base:status",
     ],
 )

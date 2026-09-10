@@ -237,6 +237,7 @@ absl::Status InMemoryStorage::Write(
     const std::vector<googlesql::Value>& values) {
   absl::MutexLock lock(mu_);
 
+  ++revision_;
   // Add the table if it does not exist.
   Table& table = tables_[table_id];
 
@@ -286,6 +287,7 @@ absl::Status InMemoryStorage::Delete(absl::Time timestamp,
     }
   }
 
+  if (row_start_itr != row_end_itr) ++revision_;
   table.erase(row_start_itr, row_end_itr);
   return absl::OkStatus();
 }

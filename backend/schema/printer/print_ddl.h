@@ -106,7 +106,7 @@ std::string PrintPlacement(const Placement* placement);
 
 // Prints the DDL statements for all tables and indexes within the given schema.
 absl::StatusOr<std::vector<std::string>> PrintDDLStatements(
-    const Schema* schema);
+    const Schema* schema, bool include_database_options = true);
 
 }  // namespace backend
 }  // namespace emulator

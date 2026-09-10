@@ -47,6 +47,8 @@ struct SchemaChangeOperation {
   absl::string_view proto_descriptor_bytes;
   ::google::spanner::admin::database::v1::DatabaseDialect database_dialect =
       ::google::spanner::admin::database::v1::GOOGLE_STANDARD_SQL;
+  // Native checkpoint restore only. Mutually exclusive with SQL statements.
+  absl::Span<const ddl::DDLStatement> parsed_statements;
 };
 
 // Database context within which a schema change is processed.

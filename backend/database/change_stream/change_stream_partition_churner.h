@@ -92,6 +92,7 @@ class ChangeStreamPartitionChurner {
   ~ChangeStreamPartitionChurner() { ClearAllChurningThreads(); }
 
   void Update(const Schema* schema);
+  void Stop() { ClearAllChurningThreads(); }
 
   int GetNumThreads();
 

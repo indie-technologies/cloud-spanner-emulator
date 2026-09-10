@@ -43,6 +43,13 @@ from the start to avoid a second analysis. See the
 See the [overall performance impact](PERFORMANCE.md) for a direct comparison of
 all changes against the original emulator, including 1,024-step migrations.
 
+## Optional development persistence
+
+Use `--state_file=/data/spanner.snapshot --checkpoint_interval=60s` with the
+native binary or gateway to restore/checkpoint development databases while
+keeping normal operations in memory. See [PERSISTENCE.md](PERSISTENCE.md) for
+behavior, validation, benchmarks, limits, and the separate Found wrapper changes.
+
 ## Quickstart
 
 There are multiple ways to invoke the emulator.
@@ -230,8 +237,9 @@ Notable limitations:
   https://cloud.google.com/spanner/docs/transactions) applies to the Cloud
   Spanner service as well.
 
-- The emulator does not support persistence - all data is kept in memory and
-  discarded when the emulator terminates.
+- The emulator is ephemeral by default. This fork supports optional
+  [development checkpoints](PERSISTENCE.md) with `--state_file`; queries and
+  writes still operate in memory.
 
 - Error messages may not be consistent between the emulator and the Cloud
   Spanner service. Error messages are not part of Cloud Spanner's API contract

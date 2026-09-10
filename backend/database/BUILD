@@ -27,6 +27,7 @@ cc_library(
     name = "database",
     srcs = [
         "database.cc",
+        "snapshot.cc",
     ],
     hdrs = [
         "database.h",
@@ -34,6 +35,10 @@ cc_library(
     deps = [
         "//backend/actions:manager",
         "//backend/common:ids",
+        "//backend/persistence:snapshot_cc_proto",
+        "//backend/persistence:values",
+        "//backend/schema/printer:print_ddl",
+        "//backend/schema/backfills:schema_backfillers",
         "//backend/database/change_stream:change_stream_partition_churner",
         "//backend/database/pg_oid_assigner",
         "//backend/locking:manager",
@@ -85,6 +90,22 @@ cc_test(
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
         "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "snapshot_test",
+    srcs = ["snapshot_test.cc"],
+    deps = [
+        ":database",
+        "//backend/persistence:values",
+        "//backend/schema/printer:print_ddl",
+        "//common:bit_reverse",
+        "//third_party/spanner_pg/datatypes/extended:pg_jsonb_type",
+        "//third_party/spanner_pg/datatypes/extended:pg_numeric_type",
+        "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googlesql//googlesql/public:json_value",
         "@com_google_googletest//:gtest_main",
     ],
 )

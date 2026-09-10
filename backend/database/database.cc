@@ -61,11 +61,24 @@ namespace backend {
 Database::Database()
     : transaction_id_generator_(absl::ToUnixMicros(absl::Now())) {}
 
+Database::~Database() {
+  if (change_stream_partition_churner_) change_stream_partition_churner_->Stop();
+  // Sequence IDs are global, but their lifetime is one database. Failed
+  // restores and repeated development restarts must not leak counter entries.
+  if (versioned_catalog_) {
+    for (auto* sequence : GetLatestSchema()->sequences()) {
+      sequence->RemoveSequenceFromLastValuesMap();
+    }
+  }
+}
+
 absl::StatusOr<std::unique_ptr<Database>> Database::Create(
     Clock* clock, std::string_view database_id,
-    const SchemaChangeOperation& schema_change_operation) {
+    const SchemaChangeOperation& schema_change_operation,
+    bool start_background_tasks) {
   auto database = absl::WrapUnique(new Database());
   database->clock_ = clock;
+  database->background_tasks_enabled_ = start_background_tasks;
   database->database_id_ = database_id;
   database->storage_ = std::make_unique<InMemoryStorage>();
   database->lock_manager_ = std::make_unique<LockManager>(clock);
@@ -76,7 +89,8 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
       schema_change_operation.database_dialect ==
       database_api::DatabaseDialect::POSTGRESQL);
 
-  if (schema_change_operation.statements.empty()) {
+  if (schema_change_operation.statements.empty() &&
+      schema_change_operation.parsed_statements.empty()) {
     if (database->dialect_ == database_api::DatabaseDialect::POSTGRESQL) {
       // Create an empty schema with the dialect set.
       database->versioned_catalog_ =
@@ -111,8 +125,7 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
                            database.get()),
           database->clock_);
 
-  database->change_stream_partition_churner_->Update(
-      database->versioned_catalog_->GetLatestSchema());
+  if (start_background_tasks) database->StartBackgroundTasks();
 
   // Some functions need to access the schema (e.g. sequence functions), so
   // set the latest schema to the function catalog here.
@@ -157,7 +170,8 @@ absl::Status Database::UpdateSchema(
     const SchemaChangeOperation& schema_change_operation,
     int* num_succesful_statements, absl::Time* commit_timestamp,
     absl::Status* backfill_status) {
-  if (schema_change_operation.statements.empty()) {
+  if (schema_change_operation.statements.empty() &&
+      schema_change_operation.parsed_statements.empty()) {
     return error::UpdateDatabaseMissingStatements();
   }
 
@@ -197,12 +211,12 @@ absl::Status Database::UpdateSchema(
   if (result.updated_schema != nullptr) {
     GOOGLESQL_RETURN_IF_ERROR(versioned_catalog_->AddSchema(
         update_timestamp, std::move(result.updated_schema)));
+    ++schema_revision_;
     action_manager_->AddActionsForSchema(versioned_catalog_->GetLatestSchema(),
                                          query_engine_->function_catalog(),
                                          query_engine_->type_factory());
   }
-  change_stream_partition_churner_->Update(
-      versioned_catalog_->GetLatestSchema());
+  if (background_tasks_enabled_) StartBackgroundTasks();
 
   // Some functions need to access the schema (e.g. sequence functions), so
   // set the latest schema to the function catalog here.

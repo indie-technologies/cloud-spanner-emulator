@@ -141,9 +141,14 @@ void ChangeStreamPartitionChurner::PeriodicChurnPartitions(
       const auto delay =
           absl::GetFlag(FLAGS_change_stream_churn_thread_retry_jitter) *
           absl::Uniform<double>(absl::BitGen(), 0, 1);
-      absl::SleepFor(
-          absl::GetFlag(FLAGS_change_stream_churn_thread_retry_sleep_interval) +
-          absl::Milliseconds(delay));
+      {
+        absl::MutexLock lock(churning_thread->mu);
+        churning_thread->mu.AwaitWithTimeout(
+            absl::Condition(&churning_thread->stop_thread),
+            absl::GetFlag(FLAGS_change_stream_churn_thread_retry_sleep_interval) +
+                absl::Milliseconds(delay));
+        if (churning_thread->stop_thread) return;
+      }
       if (!s.ok() && !absl::IsAborted(s)) {
         ABSL_LOG(ERROR) << "Failed to churn change stream " << change_stream_name
                    << " with status: " << s;

@@ -55,6 +55,12 @@ class Instance {
   // Converts this instance object to its proto representation.
   void ToProto(admin::instance::v1::Instance* instance) const;
 
+  // Startup restore before this entity is visible to requests.
+  void RestoreTimestamps(absl::Time created, absl::Time updated) {
+    create_time_ = created;
+    update_time_ = updated;
+  }
+
  private:
   // The name for this instance.
   std::string name_;

@@ -265,7 +265,8 @@ class SchemaUpdaterImpl {
   // made.
   absl::StatusOr<std::unique_ptr<const Schema>> ApplyDDLStatement(
       absl::string_view statement, absl::string_view proto_descriptor_bytes,
-      const database_api::DatabaseDialect& dialect);
+      const database_api::DatabaseDialect& dialect,
+      const ddl::DDLStatement* parsed_statement = nullptr);
 
   // Run any pending schema actions resulting from the schema change statements.
   absl::Status RunPendingActions(
@@ -854,14 +855,19 @@ absl::Status ValidateDdlStatement(const ddl::DDLStatement& ddl,
 absl::StatusOr<std::unique_ptr<const Schema>>
 SchemaUpdaterImpl::ApplyDDLStatement(
     absl::string_view statement, absl::string_view proto_descriptor_bytes,
-    const database_api::DatabaseDialect& dialect) {
-  if (statement.empty()) {
+    const database_api::DatabaseDialect& dialect,
+    const ddl::DDLStatement* parsed_statement) {
+  if (statement.empty() && parsed_statement == nullptr) {
     return error::EmptyDDLStatement();
   }
 
   GOOGLESQL_RET_CHECK(!editor_->HasModifications());
-  GOOGLESQL_ASSIGN_OR_RETURN(std::unique_ptr<ddl::DDLStatement> ddl_statement,
-                   ParseDDLByDialect(statement, dialect));
+  std::unique_ptr<ddl::DDLStatement> ddl_statement;
+  if (parsed_statement != nullptr) {
+    ddl_statement = std::make_unique<ddl::DDLStatement>(*parsed_statement);
+  } else {
+    GOOGLESQL_ASSIGN_OR_RETURN(ddl_statement, ParseDDLByDialect(statement, dialect));
+  }
   GOOGLESQL_RETURN_IF_ERROR(ValidateDdlStatement(*ddl_statement, dialect));
   // Apply the statement to the schema graph.
   auto proto_bundle = latest_schema_->proto_bundle();
@@ -1205,7 +1211,13 @@ SchemaUpdaterImpl::ApplyDDLStatements(
     const SchemaChangeOperation& schema_change_operation) {
   std::vector<SchemaValidationContext> pending_work;
 
-  for (const auto& statement : schema_change_operation.statements) {
+  const auto& parsed = schema_change_operation.parsed_statements;
+  const auto& statements = schema_change_operation.statements;
+  GOOGLESQL_RET_CHECK(parsed.empty() || statements.empty());
+  for (size_t i = 0; i < std::max(parsed.size(), statements.size()); ++i) {
+    absl::string_view statement = parsed.empty()
+                                      ? absl::string_view(statements[i])
+                                      : absl::string_view();
     GOOGLESQL_VLOG(2) << "Applying statement " << statement;
 
     // Set up the SchemaValidationContext before passing it to `editor_`. This
@@ -1240,7 +1252,8 @@ SchemaUpdaterImpl::ApplyDDLStatements(
         auto new_schema,
         ApplyDDLStatement(statement,
                           schema_change_operation.proto_descriptor_bytes,
-                          schema_change_operation.database_dialect));
+                          schema_change_operation.database_dialect,
+                          parsed.empty() ? nullptr : &parsed[i]));
 
     // This indicates that the statement was a no-op, e.g., a CREATE SEQUENCE IF
     // NOT EXISTS statement for an existent sequence.

@@ -17,6 +17,9 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_COLLECTIONS_INSTANCE_PARTITION_MANAGER_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_COLLECTIONS_INSTANCE_PARTITION_MANAGER_H_
 
+#include <cstdint>
+#include <vector>
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -37,11 +40,23 @@ namespace frontend {
 // emulator.
 class InstancePartitionManager {
  public:
+  struct Snapshot {
+    uint64_t revision;
+    std::vector<std::shared_ptr<InstancePartition>> entries;
+  };
+  Snapshot Capture() const {
+    absl::ReaderMutexLock lock(mu_);
+    Snapshot result{revision_, {}};
+    for (const auto& [name, entry] : partitions_) result.entries.push_back(entry);
+    return result;
+  }
   // Creates a new instance partition with the given URI.
   absl::StatusOr<std::shared_ptr<InstancePartition>> CreateInstancePartition(
       const std::string& partition_uri,
       const admin::instance::v1::InstancePartition& partition_proto)
       ABSL_LOCKS_EXCLUDED(mu_);
+
+  absl::Status Restore(const admin::instance::v1::InstancePartition& proto);
 
   // Returns an instance partition with the given URI.
   absl::StatusOr<std::shared_ptr<InstancePartition>> GetInstancePartition(
@@ -59,6 +74,7 @@ class InstancePartitionManager {
  private:
   // Mutex to guard state below.
   mutable absl::Mutex mu_;
+  uint64_t revision_ ABSL_GUARDED_BY(mu_) = 0;
 
   // Map from instance partition URI to instance partition objects.
   absl::btree_map<std::string, std::shared_ptr<InstancePartition>> partitions_

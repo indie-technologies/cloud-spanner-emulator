@@ -16,6 +16,11 @@
 
 #include <algorithm>
 #include <memory>
+#include <csignal>
+#include <pthread.h>
+
+#include "absl/flags/flag.h"
+#include "absl/time/time.h"
 
 #include "absl/flags/parse.h"
 #include "googlesql/base/logging.h"
@@ -23,13 +28,25 @@
 #include "common/config.h"
 #include "frontend/server/server.h"
 
+ABSL_FLAG(std::string, state_file, "", "Optional development snapshot file; missing files start empty.");
+ABSL_FLAG(absl::Duration, checkpoint_interval, absl::Seconds(60), "Checkpoint interval when state_file is set.");
+
 using Server = ::google::spanner::emulator::frontend::Server;
 
 int main(int argc, char** argv) {
+  // Block before creating worker threads. sigwait handles shutdown in ordinary
+  // code, where draining RPCs, joining threads and file I/O are safe.
+  sigset_t signals;
+  sigemptyset(&signals);
+  sigaddset(&signals, SIGINT);
+  sigaddset(&signals, SIGTERM);
+  if (pthread_sigmask(SIG_BLOCK, &signals, nullptr) != 0) return EXIT_FAILURE;
   // Start the emulator gRPC server.
   absl::ParseCommandLine(argc, argv);
   Server::Options options;
   options.server_address = google::spanner::emulator::config::grpc_host_port();
+  options.state_file = absl::GetFlag(FLAGS_state_file);
+  options.checkpoint_interval = absl::GetFlag(FLAGS_checkpoint_interval);
   std::unique_ptr<Server> server = Server::Create(options);
   if (!server) {
     ABSL_LOG(ERROR) << "Failed to start gRPC server.";
@@ -40,8 +57,13 @@ int main(int argc, char** argv) {
   ABSL_LOG(INFO) << "Server address: "
             << absl::StrCat(server->host(), ":", server->port());
 
-  // Block forever until the server is terminated.
-  server->WaitForShutdown();
+  int received;
+  if (sigwait(&signals, &received) != 0) return EXIT_FAILURE;
+  auto status = server->Shutdown();
+  if (!status.ok()) {
+    ABSL_LOG(ERROR) << "Final checkpoint failed: " << status;
+    return EXIT_FAILURE;
+  }
 
   return EXIT_SUCCESS;
 }

@@ -29,6 +29,7 @@
 #include "absl/synchronization/mutex.h"
 #include "common/errors.h"
 #include "frontend/common/labels.h"
+#include "frontend/converters/time.h"
 #include "googlesql/base/status_macros.h"
 
 namespace google {
@@ -97,12 +98,23 @@ absl::StatusOr<std::shared_ptr<Instance>> InstanceManager::CreateInstance(
   if (!inserted.second) {
     return error::InstanceAlreadyExists(instance_uri);
   }
+  ++revision_;
   return inserted.first->second;
 }
 
 void InstanceManager::DeleteInstance(const std::string& instance_uri) {
   absl::MutexLock lock(&mu_);
-  instances_.erase(instance_uri);
+  if (instances_.erase(instance_uri)) ++revision_;
+}
+
+absl::Status InstanceManager::Restore(const instance_api::Instance& proto) {
+  GOOGLESQL_ASSIGN_OR_RETURN(auto created, TimestampFromProto(proto.create_time()));
+  GOOGLESQL_ASSIGN_OR_RETURN(auto updated, TimestampFromProto(proto.update_time()));
+  auto normalized = proto;
+  normalized.clear_node_count();  // ToProto includes both unit representations.
+  GOOGLESQL_ASSIGN_OR_RETURN(auto entity, CreateInstance(proto.name(), normalized));
+  entity->RestoreTimestamps(created, updated);
+  return absl::OkStatus();
 }
 
 }  // namespace frontend

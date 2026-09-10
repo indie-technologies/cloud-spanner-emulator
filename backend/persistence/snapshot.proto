@@ -1,0 +1,57 @@
+// Copyright 2026 Google LLC
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy at https://www.apache.org/licenses/LICENSE-2.0
+syntax = "proto3";
+package google.spanner.emulator.persistence;
+
+import "googlesql/public/value.proto";
+import "backend/schema/ddl/operations.proto";
+import "google/spanner/admin/instance/v1/spanner_instance_admin.proto";
+
+// The file envelope also carries a magic number, version, length and CRC32C.
+// Runtime IDs are deliberately never used as persistent identifiers.
+message Snapshot {
+  uint32 format_version = 1;
+  repeated google.spanner.admin.instance.v1.Instance instances = 2;
+  repeated Database databases = 3;
+  repeated google.spanner.admin.instance.v1.InstancePartition partitions = 4;
+}
+message Database {
+  string uri = 1;
+  int32 dialect = 2;
+  // Canonical CURRENT schema, not the migration history. Rows bypass SQL.
+  repeated google.spanner.emulator.backend.ddl.DDLStatement schema = 3;
+  bytes proto_descriptors = 4;
+  repeated Table tables = 5;
+  repeated Sequence sequences = 6;
+}
+message Table {
+  enum Kind { USER = 0; CHANGE_STREAM_DATA = 1; CHANGE_STREAM_PARTITION = 2; }
+  Kind kind = 1;
+  // Table name, or owning change stream name for internal tables.
+  string name = 2;
+  repeated Column columns = 3;
+  repeated Row rows = 4;
+}
+message Column {
+  string name = 1;
+  string type = 2;
+}
+message Row {
+  repeated Value key = 1;
+  repeated Value cells = 2;
+}
+message Value {
+  // Absent storage cell and typed NULL are different.
+  bool absent = 1;
+  googlesql.ValueProto value = 2;
+}
+message Sequence {
+  // Named sequences use name. Identity sequences use their owning column,
+  // since their generated names and IDs change when rebuilding a schema.
+  string name = 1;
+  string identity_table = 2;
+  string identity_column = 3;
+  optional int64 next_counter = 4;
+}

@@ -106,6 +106,7 @@ absl::StatusOr<std::shared_ptr<Database>> DatabaseManager::CreateDatabase(
   }
 
   // Record this database in the database manager.
+  ++revision_;
   database_map_[database_uri] = database;
   num_databases_per_instance_[instance_uri] += 1;
 
@@ -125,6 +126,7 @@ absl::StatusOr<std::shared_ptr<Database>> DatabaseManager::GetDatabase(
 absl::Status DatabaseManager::DeleteDatabase(const std::string& database_uri) {
   absl::MutexLock lock(mu_);
   if (database_map_.erase(database_uri) > 0) {
+    ++revision_;
     absl::string_view project_id, instance_id, database_id;
     GOOGLESQL_RETURN_IF_ERROR(ParseDatabaseUri(database_uri, &project_id, &instance_id,
                                      &database_id));
@@ -138,6 +140,18 @@ absl::StatusOr<std::vector<std::shared_ptr<Database>>>
 DatabaseManager::ListDatabases(const std::string& instance_uri) const {
   absl::ReaderMutexLock lock(mu_);
   return GetDatabasesByInstance(database_map_, instance_uri);
+}
+
+absl::Status DatabaseManager::AddRestoredDatabase(std::shared_ptr<Database> database) {
+  absl::string_view project, instance, id;
+  GOOGLESQL_RETURN_IF_ERROR(ParseDatabaseUri(database->database_uri(), &project, &instance, &id));
+  absl::MutexLock lock(mu_);
+  if (!database_map_.emplace(database->database_uri(), database).second) {
+    return absl::DataLossError("Duplicate database in snapshot");
+  }
+  ++num_databases_per_instance_[MakeInstanceUri(project, instance)];
+  ++revision_;
+  return absl::OkStatus();
 }
 
 }  // namespace frontend

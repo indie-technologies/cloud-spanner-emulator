@@ -17,6 +17,9 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_COLLECTIONS_INSTANCE_MANAGER_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_COLLECTIONS_INSTANCE_MANAGER_H_
 
+#include <cstdint>
+#include <vector>
+
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
@@ -32,11 +35,23 @@ namespace frontend {
 // InstanceManager manages the set of active instances in the emulator.
 class InstanceManager {
  public:
+  struct Snapshot {
+    uint64_t revision;
+    std::vector<std::shared_ptr<Instance>> entries;
+  };
+  Snapshot Capture() const {
+    absl::ReaderMutexLock lock(mu_);
+    Snapshot result{revision_, {}};
+    for (const auto& [name, entry] : instances_) result.entries.push_back(entry);
+    return result;
+  }
   // Creates a new instance with the given URI.
   absl::StatusOr<std::shared_ptr<Instance>> CreateInstance(
       const std::string& instance_uri,
       const admin::instance::v1::Instance& instance_proto)
       ABSL_LOCKS_EXCLUDED(mu_);
+
+  absl::Status Restore(const admin::instance::v1::Instance& proto);
 
   // Returns an instance with the given URI.
   absl::StatusOr<std::shared_ptr<Instance>> GetInstance(
@@ -52,6 +67,7 @@ class InstanceManager {
  private:
   // Mutex to guard state below.
   mutable absl::Mutex mu_;
+  uint64_t revision_ ABSL_GUARDED_BY(mu_) = 0;
 
   // Map from instance URI to instance objects.
   std::map<std::string, std::shared_ptr<Instance>> instances_

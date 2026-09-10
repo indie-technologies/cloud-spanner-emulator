@@ -21,6 +21,7 @@
 #include <string>
 
 #include "frontend/server/environment.h"
+#include "frontend/server/persistence.h"
 #include "grpcpp/impl/service_type.h"
 #include "grpcpp/server.h"
 #include "grpcpp/support/status.h"
@@ -54,6 +55,8 @@ class Server {
  public:
   struct Options {
     std::string server_address;
+    std::string state_file;
+    absl::Duration checkpoint_interval = absl::Seconds(60);
   };
 
   // Returns an initialized Server, or nullptr if the initialization failed.
@@ -66,7 +69,7 @@ class Server {
   void WaitForShutdown();
 
   // Shuts down the grpc server.
-  void Shutdown();
+  absl::Status Shutdown();
 
   // Accessor to the ServerEnv of the server.
   ServerEnv* env() { return env_.get(); }
@@ -81,6 +84,7 @@ class Server {
 
   // Environment shared by all handlers.
   std::unique_ptr<ServerEnv> env_;
+  std::unique_ptr<Persistence> persistence_;
 
   // Services implemented by this gRPC server.
   std::unique_ptr<grpc::Service> database_admin_service_;

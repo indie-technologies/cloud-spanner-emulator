@@ -51,6 +51,12 @@ class InstancePartition {
   // Converts this instance partition object to its proto representation.
   void ToProto(admin::instance::v1::InstancePartition* partition) const;
 
+  // Startup restore before this entity is visible to requests.
+  void RestoreTimestamps(absl::Time created, absl::Time updated) {
+    create_time_ = created;
+    update_time_ = updated;
+  }
+
  private:
   // The name (URI) for this instance partition.
   std::string name_;

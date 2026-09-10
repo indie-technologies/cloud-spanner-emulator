@@ -17,6 +17,9 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_DATABASE_MANAGER_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_DATABASE_MANAGER_H_
 
+#include <cstdint>
+#include <vector>
+
 #include <map>
 #include <memory>
 #include <string>
@@ -44,6 +47,16 @@ namespace frontend {
 // DatabaseManager manages the set of active databases in the emulator.
 class DatabaseManager {
  public:
+  struct Snapshot {
+    uint64_t revision;
+    std::vector<std::shared_ptr<Database>> entries;
+  };
+  Snapshot Capture() const {
+    absl::ReaderMutexLock lock(mu_);
+    Snapshot result{revision_, {}};
+    for (const auto& [name, entry] : database_map_) result.entries.push_back(entry);
+    return result;
+  }
   explicit DatabaseManager(Clock* clock) : clock_(clock) {}
 
   // Creates a database with a schema initialized from `create_statements`.
@@ -51,6 +64,9 @@ class DatabaseManager {
       const std::string& database_uri,
       const backend::SchemaChangeOperation& schema_change_operation)
       ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Startup only: installs a fully restored backend after file validation.
+  absl::Status AddRestoredDatabase(std::shared_ptr<Database> database);
 
   // Returns a database with the given URI.
   absl::StatusOr<std::shared_ptr<Database>> GetDatabase(
@@ -70,6 +86,7 @@ class DatabaseManager {
 
   // Mutex to guard state below.
   mutable absl::Mutex mu_;
+  uint64_t revision_ ABSL_GUARDED_BY(mu_) = 0;
 
   // Map from database URI to database objects.
   std::map<std::string, std::shared_ptr<Database>> database_map_

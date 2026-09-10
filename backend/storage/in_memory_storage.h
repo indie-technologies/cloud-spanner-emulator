@@ -48,6 +48,12 @@ namespace backend {
 // This class is thread-safe.
 class InMemoryStorage : public Storage {
  public:
+  // Mutations already hold mu_; revision tracking adds no locks to writes.
+  uint64_t revision() const {
+    absl::MutexLock lock(mu_);
+    return revision_;
+  }
+
   std::unique_ptr<Storage> CreateSnapshot() override ABSL_LOCKS_EXCLUDED(mu_);
 
   absl::Status Lookup(absl::Time timestamp, const TableID& table_id,
@@ -118,6 +124,7 @@ class InMemoryStorage : public Storage {
 
   mutable absl::Mutex mu_;
   Tables tables_ ABSL_GUARDED_BY(mu_);
+  uint64_t revision_ ABSL_GUARDED_BY(mu_) = 0;
   // Snapshot contents are also guarded by mu_. Expired entries are pruned on
   // registration and writes, so read-only workloads cannot grow this list.
   std::vector<std::weak_ptr<SnapshotState>> snapshots_ ABSL_GUARDED_BY(mu_);
