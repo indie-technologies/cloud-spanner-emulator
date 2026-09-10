@@ -6,6 +6,37 @@ including all schema graph, transaction, storage, schema lifetime, SQL
 analysis, and query-catalog changes. These are cumulative comparisons, not just
 the latest pass.
 
+## Restoring concurrent reads
+
+Commit `14f155de` restores concurrent strong snapshots alongside one writer.
+The following paired comparison uses the saved serial-fork benchmark binary and
+this commit on the same macOS arm64 machine. Run order was serial, concurrent,
+concurrent, serial; each run had three repetitions. Values are medians of the
+two run medians. No compilation ran during measurement.
+
+| Workload | Serial fork | Concurrent reads | Change |
+| --- | ---: | ---: | ---: |
+| 64 table migrations, one DDL batch | 4.736 ms | 4.765 ms | +0.6% |
+| 64 table migrations, separate DDL calls | 4.772 ms | 4.836 ms | +1.3% |
+| 256 table migrations, separate DDL calls | 53.308 ms | 53.589 ms | +0.5% |
+| 1,024 table migrations, separate DDL calls | 834.832 ms | 837.911 ms | +0.4% |
+| Streaming `SELECT 1`, default test schema | 238.3 µs | 210.5 µs | −11.7% |
+| Streaming `SELECT 1`, 128 extra tables | 237.6 µs | 217.8 µs | −8.3% |
+| Streaming empty table scan, 128 extra tables | 240.0 µs | 244.1 µs | +1.7% |
+| Migration process peak RSS | 40.0 MiB | 39.8 MiB | Approximately unchanged |
+
+This comparison shows no material loss in the measured serial workloads. It
+does not measure write-heavy workloads with long-lived snapshots: those retain
+one before-image per changed row per active reader. Ordinary writes with no
+active readers retain the direct current-value storage path. Stale timestamp
+bounds remain unsupported.
+
+The change passed 1,374 distinct unit/integration tests across storage, locking,
+transactions, SQL, schema updates, read conversion, and gRPC APIs on macOS.
+Coverage includes randomized snapshot/model comparisons, multi-row commit
+publication, updates/deletes/reinserts, readers spanning DDL, pinned time-zone
+settings, multiplexed sessions, and change streams in both SQL dialects.
+
 ## Full migration and query workloads
 
 Measured on macOS arm64 on September 9, 2026, using release builds and median
