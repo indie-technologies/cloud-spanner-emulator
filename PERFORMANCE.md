@@ -31,11 +31,12 @@ one before-image per changed row per active reader. Ordinary writes with no
 active readers retain the direct current-value storage path. Stale timestamp
 bounds remain unsupported.
 
-The change passed 1,374 distinct unit/integration tests across storage, locking,
+The change passed 1,300 executed unit/integration test cases across storage, locking,
 transactions, SQL, schema updates, read conversion, and gRPC APIs on macOS.
 Coverage includes randomized snapshot/model comparisons, multi-row commit
 publication, updates/deletes/reinserts, readers spanning DDL, pinned time-zone
 settings, multiplexed sessions, and change streams in both SQL dialects.
+Pre-existing skipped and disabled cases are excluded from this count.
 
 ## Full migration and query workloads
 
