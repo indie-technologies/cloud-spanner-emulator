@@ -237,6 +237,9 @@ class SchemaUpdaterImpl {
   absl::StatusOr<std::vector<SchemaValidationContext>> ApplyDDLStatements(
       const SchemaChangeOperation& schema_change_operation);
 
+  absl::StatusOr<std::unique_ptr<const Schema>> ApplySnapshot(
+      const SchemaChangeOperation& operation);
+
   std::vector<std::unique_ptr<const Schema>> GetIntermediateSchemas() {
     return std::move(intermediate_schemas_);
   }
@@ -754,6 +757,9 @@ class SchemaUpdaterImpl {
   // Manages global schema names to prevent and generate unique names.
   GlobalSchemaNames global_names_;
 
+  // Only set while building an unpublished snapshot schema.
+  SchemaBuilder* snapshot_builder_ = nullptr;
+
   // Assigns OIDs to database objects when dialect is POSTGRESQL. The assigner
   // is owned by the database and is shared across all schema changes.
   PgOidAssigner* pg_oid_assigner_;
@@ -1201,9 +1207,115 @@ SchemaUpdaterImpl::ApplyDDLStatement(
   // generation). If there is a need to access proto_bundle after
   // validation, please use schema->proto_bundle().
   statement_context_->set_proto_bundle(proto_bundle);
+  if (snapshot_builder_ != nullptr) {
+    GOOGLESQL_ASSIGN_OR_RETURN(auto additions, editor_->TakeAddedNodes());
+    std::vector<const SchemaNode*> added;
+    for (auto& node : additions) {
+      added.push_back(node.get());
+      snapshot_builder_->AddNode(std::move(node));
+    }
+    snapshot_builder_->SetProtoBundle(proto_bundle);
+    latest_schema_ = snapshot_builder_->schema();
+    // Reject malformed definitions before subsequent builders can rely on
+    // them. Only new nodes are checked here; the full graph is validated once
+    // at the end, including relationships changed by later definitions.
+    for (const auto* node : added) {
+      GOOGLESQL_RETURN_IF_ERROR(node->Validate(statement_context_));
+    }
+    return nullptr;
+  }
   GOOGLESQL_ASSIGN_OR_RETURN(auto new_schema_graph, editor_->CanonicalizeGraph());
   return std::make_unique<const OwningSchema>(
       std::move(new_schema_graph), proto_bundle, dialect, database_id_);
+}
+
+// Snapshot v1 contains current definitions, not arbitrary migration programs.
+// Restrict in-place construction to additions and the options/FKs emitted by
+// SerializeSchema. In particular, destructive edits and replacements must not
+// invalidate pointers already retained by builders and queued actions.
+bool IsSnapshotDefinition(const ddl::DDLStatement& statement) {
+  switch (statement.statement_case()) {
+    case ddl::DDLStatement::kCreateTable:
+    case ddl::DDLStatement::kCreateIndex:
+    case ddl::DDLStatement::kCreateSearchIndex:
+    case ddl::DDLStatement::kCreateVectorIndex:
+    case ddl::DDLStatement::kCreateSequence:
+    case ddl::DDLStatement::kCreateSchema:
+    case ddl::DDLStatement::kCreateLocalityGroup:
+    case ddl::DDLStatement::kCreateProtoBundle:
+    case ddl::DDLStatement::kCreateChangeStream:
+    case ddl::DDLStatement::kCreateModel:
+    case ddl::DDLStatement::kCreatePropertyGraph:
+    case ddl::DDLStatement::kCreatePlacement:
+    case ddl::DDLStatement::kAlterDatabase:
+      return true;
+    case ddl::DDLStatement::kCreateFunction:
+      return !statement.create_function().is_or_replace();
+    case ddl::DDLStatement::kAlterTable:
+      return statement.alter_table().has_add_foreign_key();
+    case ddl::DDLStatement::kAlterLocalityGroup:
+      return statement.alter_locality_group().locality_group_name() ==
+             "default";
+    default:
+      return false;
+  }
+}
+
+absl::StatusOr<std::unique_ptr<const Schema>> SchemaUpdaterImpl::ApplySnapshot(
+    const SchemaChangeOperation& operation) {
+  GOOGLESQL_RET_CHECK(operation.statements.empty());
+  GOOGLESQL_RET_CHECK(
+      latest_schema_->GetSchemaGraph()->GetSchemaNodes().empty());
+  for (const auto& statement : operation.parsed_statements) {
+    if (!IsSnapshotDefinition(statement)) {
+      return absl::DataLossError(
+          "Invalid snapshot schema: expected current object definitions");
+    }
+  }
+  SchemaBuilder builder(operation.database_dialect, database_id_);
+  snapshot_builder_ = &builder;
+  SchemaValidationContext context(storage_, &global_names_, type_factory_,
+                                  schema_change_timestamp_,
+                                  operation.database_dialect);
+  context.SetOldSchemaSnapshot(latest_schema_);
+  statement_context_ = &context;
+  latest_schema_ = builder.schema();
+  // Every definition is newly allocated. Previously added nodes stay private
+  // and can be edited directly instead of cloning the accumulated graph.
+  editor_ =
+      std::make_unique<SchemaGraphEditor>(SchemaGraph::CreateEmpty(), &context);
+  for (const auto& statement : operation.parsed_statements) {
+    GOOGLESQL_RETURN_IF_ERROR(
+        ApplyDDLStatement({}, operation.proto_descriptor_bytes,
+                          operation.database_dialect, &statement)
+            .status());
+  }
+  snapshot_builder_ = nullptr;
+
+  // Canonicalize once with the existing graph editor. This fixes references and
+  // runs all normal graph validators, while holding at most two full graphs.
+  // Queued actions may still refer to builder nodes, so keep builder alive
+  // until they have run against the completed schema.
+  std::unique_ptr<const Schema> temporary;
+  context.SetOldSchemaSnapshot(builder.schema());
+  context.set_proto_bundle(builder.schema()->proto_bundle());
+  context.SetTempNewSchemaSnapshotConstructor(
+      [&](const SchemaGraph* graph) -> const Schema* {
+        temporary =
+            std::make_unique<Schema>(graph, builder.schema()->proto_bundle(),
+                                     operation.database_dialect, database_id_);
+        return temporary.get();
+      });
+  editor_ = std::make_unique<SchemaGraphEditor>(
+      builder.schema()->GetSchemaGraph(), &context);
+  GOOGLESQL_ASSIGN_OR_RETURN(auto graph, editor_->CanonicalizeGraph());
+  auto schema = std::make_unique<const OwningSchema>(
+      std::move(graph), builder.schema()->proto_bundle(),
+      operation.database_dialect, database_id_);
+  context.SetValidatedNewSchemaSnapshot(schema.get());
+  GOOGLESQL_RETURN_IF_ERROR(context.RunSchemaChangeActions());
+  pg_oid_assigner_->MarkNextPostgresqlOidForIntermediateSchema();
+  return schema;
 }
 
 absl::StatusOr<std::vector<SchemaValidationContext>>
@@ -7000,6 +7112,23 @@ absl::StatusOr<SchemaChangeResult> SchemaUpdater::UpdateSchemaFromDDL(
       .updated_schema = std::move(new_schema),
       .backfill_status = backfill_status,
   };
+}
+
+absl::StatusOr<std::unique_ptr<const Schema>>
+SchemaUpdater::CreateSchemaFromSnapshot(const SchemaChangeOperation& operation,
+                                        const SchemaChangeContext& context) {
+  GOOGLESQL_ASSIGN_OR_RETURN(
+      auto updater,
+      SchemaUpdaterImpl::Build(
+          context.type_factory, context.table_id_generator,
+          context.column_id_generator, context.storage,
+          context.schema_change_timestamp, context.pg_oid_assigner,
+          EmptySchema(context.database_id, operation.database_dialect),
+          context.database_id));
+  context.pg_oid_assigner->BeginAssignment();
+  GOOGLESQL_ASSIGN_OR_RETURN(auto schema, updater.ApplySnapshot(operation));
+  GOOGLESQL_RETURN_IF_ERROR(context.pg_oid_assigner->EndAssignment());
+  return schema;
 }
 
 absl::StatusOr<std::unique_ptr<const Schema>>

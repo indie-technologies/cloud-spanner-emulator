@@ -504,5 +504,140 @@ TEST_F(SnapshotTest, InvalidMappingsAndValuesAreRejected) {
   *invalid.mutable_tables(0)->add_rows() = invalid.tables(0).rows(0);
   EXPECT_FALSE(Database::Restore(&clock, "db", invalid).ok());
 }
+TEST_F(SnapshotTest, ManyIndexesKeepEveryRelationshipAndAcceptLaterMigrations) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto db, Create({}));
+  for (int t = 0; t < 12; ++t) {
+    const std::string table = "T" + std::to_string(t);
+    GOOGLESQL_ASSERT_OK(Ddl(db.get(), {"CREATE TABLE " + table +
+                                       " (id INT64 NOT NULL, v INT64, "
+                                       "s STRING(MAX)) PRIMARY KEY(id)"}));
+    for (int i = 0; i < 8; ++i) {
+      GOOGLESQL_ASSERT_OK(
+          Ddl(db.get(),
+              {"CREATE UNIQUE NULL_FILTERED INDEX " + table + "_I" +
+               std::to_string(i) + " ON " + table + "(v DESC) STORING(s)"}));
+    }
+    GOOGLESQL_ASSERT_OK(Write(db.get(), table, {"id", "v", "s"},
+                              {{Int64(1), Int64(2), String("before")}}));
+  }
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto restored, RoundTrip(db.get()));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto before_ddl, PrintDDLStatements(db->GetLatestSchema().get(), false));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto after_ddl,
+      PrintDDLStatements(restored->GetLatestSchema().get(), false));
+  EXPECT_EQ(before_ddl, after_ddl);
+  for (int t = 0; t < 12; ++t) {
+    const std::string table = "T" + std::to_string(t);
+    for (int i = 0; i < 8; ++i) {
+      GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+          auto rows, Read(restored.get(), table, {"id", "v", "s"},
+                          table + "_I" + std::to_string(i)));
+      EXPECT_EQ(
+          rows,
+          (std::vector<ValueList>{{Int64(1), Int64(2), String("before")}}));
+    }
+    EXPECT_FALSE(
+        Write(restored.get(), table, {"id", "v"}, {{Int64(2), Int64(2)}}).ok());
+  }
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto old_reader,
+                                 restored->CreateReadOnlyTransaction({}));
+  GOOGLESQL_ASSERT_OK(
+      Ddl(restored.get(),
+          {"DROP INDEX T0_I0", "ALTER TABLE T0 ADD COLUMN extra INT64",
+           "CREATE INDEX NewIndex ON T0(extra)"}));
+  GOOGLESQL_ASSERT_OK(Write(restored.get(), "T0", {"id", "v", "s", "extra"},
+                            {{Int64(1), Int64(3), String("after"), Int64(4)}}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto twice, RoundTrip(restored.get()));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto rows, Read(twice.get(), "T0", {"id", "extra"}, "NewIndex"));
+  EXPECT_EQ(rows, (std::vector<ValueList>{{Int64(1), Int64(4)}}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      rows, Read(twice.get(), "T0", {"id", "v", "s"}, "T0_I7"));
+  EXPECT_EQ(rows,
+            (std::vector<ValueList>{{Int64(1), Int64(3), String("after")}}));
+  EXPECT_NE(old_reader->schema()->FindIndex("T0_I0"), nullptr);
+  EXPECT_EQ(old_reader->schema()->FindIndex("NewIndex"), nullptr);
+}
+
+TEST_F(SnapshotTest,
+       FunctionsRemainAvailableDuringConstructionAndAfterRestore) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto db, Create({"CREATE FUNCTION Inc(x INT64) RETURNS INT64 SQL "
+                       "SECURITY INVOKER AS (x+1)",
+                       "CREATE FUNCTION Twice(x INT64) RETURNS INT64 SQL "
+                       "SECURITY INVOKER AS (Inc(Inc(x)))",
+                       "CREATE TABLE T (id INT64 NOT NULL, v INT64 AS "
+                       "(Twice(id)) STORED) PRIMARY KEY(id)",
+                       "CREATE INDEX ByV ON T(v)",
+                       "CREATE VIEW V SQL SECURITY INVOKER AS SELECT Inc(T.v) "
+                       "AS result FROM T"}));
+  GOOGLESQL_ASSERT_OK(Write(db.get(), "T", {"id"}, {{Int64(1)}}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto restored, RoundTrip(db.get()));
+  GOOGLESQL_ASSERT_OK(Write(restored.get(), "T", {"id"}, {{Int64(2)}}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto rows,
+                                 Read(restored.get(), "T", {"id", "v"}, "ByV"));
+  EXPECT_EQ(rows, (std::vector<ValueList>{{Int64(1), Int64(3)},
+                                          {Int64(2), Int64(4)}}));
+  GOOGLESQL_ASSERT_OK(
+      Ddl(restored.get(), {"CREATE VIEW V2 SQL SECURITY INVOKER AS SELECT "
+                           "Inc(V.result) AS result FROM V"}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto twice, RoundTrip(restored.get()));
+  EXPECT_NE(twice->GetLatestSchema()->FindView("V2"), nullptr);
+}
+
+TEST_F(SnapshotTest, MalformedSchemaDefinitionsFailBeforePublication) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto db,
+                                 Create({"CREATE TABLE T (id INT64 NOT NULL, v "
+                                         "INT64, j JSON) PRIMARY KEY(id)",
+                                         "CREATE INDEX ByV ON T(v)"}));
+  persistence::Database snapshot;
+  GOOGLESQL_ASSERT_OK(db->CaptureSnapshot().Serialize(&snapshot));
+  for (const std::string& sql :
+       {"CREATE TABLE T (id INT64) PRIMARY KEY(id)", "CREATE INDEX byv ON T(v)",
+        "CREATE INDEX Bad ON T(missing)", "CREATE INDEX Bad ON T(j)",
+        "CREATE TABLE Invalid (id JSON) PRIMARY KEY(id)",
+        "CREATE TABLE Child (id STRING(MAX)) PRIMARY KEY(id), INTERLEAVE IN "
+        "PARENT T ON DELETE CASCADE",
+        "DROP TABLE T", "ALTER TABLE T DROP COLUMN v",
+        "CREATE OR REPLACE VIEW V SQL SECURITY INVOKER AS SELECT id FROM T"}) {
+    SCOPED_TRACE(sql);
+    auto invalid = snapshot;
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto statement,
+        ParseDDLByDialect(sql, database_api::GOOGLE_STANDARD_SQL));
+    *invalid.add_schema() = *statement;
+    EXPECT_FALSE(Database::Restore(&clock, "db", invalid).ok());
+  }
+  // A failed construction must not affect a subsequent valid restore.
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto restored,
+                                 Database::Restore(&clock, "db", snapshot));
+  GOOGLESQL_ASSERT_OK(
+      Write(restored.get(), "T", {"id", "v"}, {{Int64(1), Int64(2)}}));
+}
+
+TEST_F(SnapshotTest, PostgreSqlOidAssignmentContinuesAfterRestore) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto db, Create({"CREATE TABLE t (id bigint PRIMARY KEY, v bigint)",
+                       "CREATE INDEX byv ON t(v)",
+                       "CREATE TABLE u (id bigint PRIMARY KEY)"},
+                      database_api::POSTGRESQL));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto restored, RoundTrip(db.get()));
+  const auto* schema = restored->GetLatestSchema().get();
+  auto first_oid = schema->FindTable("t")->postgresql_oid();
+  auto last_oid = schema->FindTable("u")->postgresql_oid();
+  ASSERT_TRUE(first_oid.has_value());
+  ASSERT_TRUE(last_oid.has_value());
+  GOOGLESQL_ASSERT_OK(
+      Ddl(restored.get(), {"CREATE TABLE later (id bigint PRIMARY KEY)"}));
+  auto later_oid =
+      restored->GetLatestSchema()->FindTable("later")->postgresql_oid();
+  ASSERT_TRUE(later_oid.has_value());
+  EXPECT_GT(*later_oid, *first_oid);
+  EXPECT_GT(*later_oid, *last_oid);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto twice, RoundTrip(restored.get()));
+  GOOGLESQL_ASSERT_OK(Write(twice.get(), "later", {"id"}, {{Int64(1)}}));
+}
+
 }  // namespace
 }  // namespace google::spanner::emulator::backend

@@ -273,6 +273,9 @@ class Schema {
   }
 
  private:
+  friend class SchemaBuilder;
+  void AddNodeToCatalog(const SchemaNode* node);
+
   // Tries to find the managed index from the non-fingerprint part of the
   // index name.
   const Index* FindManagedIndex(const std::string& index_name) const;
@@ -379,6 +382,37 @@ class Schema {
 
   // Holds the database id for this schema.
   const std::string database_id_;
+};
+
+// Private construction workspace for a new, unpublished schema. Existing nodes
+// may be edited in place by the DDL builders because no transaction can see it.
+// Catalog entries are appended once, instead of rebuilt after every definition.
+// The final graph must be canonicalized and validated before publication.
+class SchemaBuilder {
+ public:
+  SchemaBuilder(database_api::DatabaseDialect dialect,
+                std::string_view database_id)
+      : schema_(std::make_unique<Schema>(&graph_, ProtoBundle::CreateEmpty(),
+                                         dialect, database_id)) {}
+
+  const Schema* schema() const { return schema_.get(); }
+
+  void AddNode(std::unique_ptr<const SchemaNode> node) {
+    schema_->AddNodeToCatalog(node.get());
+    graph_.Add(std::move(node));
+  }
+
+  void SetProtoBundle(std::shared_ptr<const ProtoBundle> bundle) {
+    if (bundle != schema_->proto_bundle()) {
+      schema_ =
+          std::make_unique<Schema>(&graph_, std::move(bundle),
+                                   schema_->dialect(), schema_->database_id());
+    }
+  }
+
+ private:
+  SchemaGraph graph_;
+  std::unique_ptr<Schema> schema_;
 };
 
 // A Schema that also owns the SchemaGraph that manages the lifetime of the

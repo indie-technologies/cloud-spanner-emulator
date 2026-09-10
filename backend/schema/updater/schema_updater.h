@@ -110,6 +110,13 @@ class SchemaUpdater {
       const SchemaChangeOperation& schema_change_operation,
       const SchemaChangeContext& context);
 
+  // Restores dependency-ordered current definitions into an unpublished, empty
+  // database. Builds one private graph and validates it before returning; does
+  // not use the intermediate generations required by ordinary migrations.
+  absl::StatusOr<std::unique_ptr<const Schema>> CreateSchemaFromSnapshot(
+      const SchemaChangeOperation& schema_change_operation,
+      const SchemaChangeContext& context);
+
   // Applies the DDL statements in `schema_change_operation.statements` on top
   // of `existing_schema`. Any errors during semantic validation of the provided
   // `statements` are communicated through the return status of the function.

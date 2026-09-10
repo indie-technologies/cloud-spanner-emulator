@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
@@ -32,7 +33,6 @@
 #include "backend/schema/graph/schema_objects_pool.h"
 #include "backend/schema/updater/schema_validation_context.h"
 #include "googlesql/base/ret_check.h"
-#include "absl/status/status.h"
 #include "googlesql/base/status_macros.h"
 
 namespace google {
@@ -121,6 +121,16 @@ class SchemaGraphEditor {
 
   // Adds 'node' to the graph.
   absl::Status AddNode(std::unique_ptr<const SchemaNode> node);
+
+  // Transfer additions to an unpublished schema construction workspace. Only
+  // usable with an empty original graph; edits to these new nodes stay in
+  // place.
+  absl::StatusOr<std::vector<std::unique_ptr<const SchemaNode>>>
+  TakeAddedNodes() {
+    GOOGLESQL_RET_CHECK_EQ(num_original_nodes(), 0);
+    GOOGLESQL_RET_CHECK(deleted_nodes_.empty() && edited_clones_.empty());
+    return std::exchange(added_nodes_, {});
+  }
 
   // Makes a new clone of the schema graph, fixing up node-relationships
   // after edits and calling validation on the node graph being edited.

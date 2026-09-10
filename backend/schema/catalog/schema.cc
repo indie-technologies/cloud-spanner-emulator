@@ -738,99 +738,103 @@ Schema::Schema(const SchemaGraph* graph,
   locality_groups_.clear();
   locality_groups_map_.clear();
   for (const SchemaNode* node : graph_->GetSchemaNodes()) {
-    // Most graph nodes are columns or key columns. Neither belongs in these
-    // lookup maps, so avoid trying every catalog object type for each one.
-    if (node->As<Column>() != nullptr || node->As<KeyColumn>() != nullptr) {
-      continue;
-    }
-    const View* view = node->As<const View>();
-    if (view != nullptr) {
-      views_.push_back(view);
-      views_map_[view->Name()] = view;
-      continue;
-    }
-
-    const Table* table = node->As<const Table>();
-    if (table != nullptr && table->is_public()) {
-      tables_.push_back(table);
-      tables_map_[table->Name()] = table;
-      if (!table->synonym().empty()) {
-        synonyms_.push_back(table->synonym());
-        synonyms_map_[table->synonym()] = table;
-      }
-      continue;
-    }
-
-    const Index* index = node->As<const Index>();
-    if (index != nullptr) {
-      index_map_[index->Name()] = index;
-      continue;
-    }
-
-    const ChangeStream* change_stream = node->As<ChangeStream>();
-    if (change_stream != nullptr) {
-      change_streams_.push_back(change_stream);
-      change_streams_map_[change_stream->Name()] = change_stream;
-      continue;
-    }
-
-    const Placement* placement = node->As<Placement>();
-    if (placement != nullptr) {
-      placements_.push_back(placement);
-      placements_map_[placement->PlacementName()] = placement;
-      continue;
-    }
-
-    const Sequence* sequence = node->As<Sequence>();
-    if (sequence != nullptr) {
-      sequences_.push_back(sequence);
-      sequences_map_[sequence->Name()] = sequence;
-      continue;
-    }
-
-    const Model* model = node->As<Model>();
-    if (model != nullptr) {
-      models_.push_back(model);
-      models_map_[model->Name()] = model;
-      continue;
-    }
-
-    const PropertyGraph* property_graph = node->As<PropertyGraph>();
-    if (property_graph != nullptr) {
-      property_graphs_.push_back(property_graph);
-      property_graphs_map_[property_graph->Name()] = property_graph;
-      continue;
-    }
-
-    const NamedSchema* named_schema = node->As<NamedSchema>();
-    if (named_schema != nullptr) {
-      named_schemas_.push_back(named_schema);
-      named_schemas_map_[named_schema->Name()] = named_schema;
-      continue;
-    }
-
-    const Udf* udf = node->As<Udf>();
-    if (udf != nullptr) {
-      udfs_.push_back(udf);
-      udfs_map_[udf->Name()] = udf;
-      continue;
-    }
-
-    const LocalityGroup* locality_group = node->As<LocalityGroup>();
-    if (locality_group != nullptr) {
-      locality_groups_.push_back(locality_group);
-      locality_groups_map_[locality_group->Name()] = locality_group;
-      continue;
-    }
-
-    const DatabaseOptions* database_options = node->As<DatabaseOptions>();
-    if (database_options != nullptr) {
-      database_options_ = database_options;
-      continue;
-    }
-    // Columns need not be stored in the schema, they are just owned by the
-    // graph.
+    AddNodeToCatalog(node);
   }
+}
+
+void Schema::AddNodeToCatalog(const SchemaNode* node) {
+  // Most graph nodes are columns or key columns. Neither belongs in these
+  // lookup maps, so avoid trying every catalog object type for each one.
+  if (node->As<Column>() != nullptr || node->As<KeyColumn>() != nullptr) {
+    return;
+  }
+  const View* view = node->As<const View>();
+  if (view != nullptr) {
+    views_.push_back(view);
+    views_map_[view->Name()] = view;
+    return;
+  }
+
+  const Table* table = node->As<const Table>();
+  if (table != nullptr && table->is_public()) {
+    tables_.push_back(table);
+    tables_map_[table->Name()] = table;
+    if (!table->synonym().empty()) {
+      synonyms_.push_back(table->synonym());
+      synonyms_map_[table->synonym()] = table;
+    }
+    return;
+  }
+
+  const Index* index = node->As<const Index>();
+  if (index != nullptr) {
+    index_map_[index->Name()] = index;
+    return;
+  }
+
+  const ChangeStream* change_stream = node->As<ChangeStream>();
+  if (change_stream != nullptr) {
+    change_streams_.push_back(change_stream);
+    change_streams_map_[change_stream->Name()] = change_stream;
+    return;
+  }
+
+  const Placement* placement = node->As<Placement>();
+  if (placement != nullptr) {
+    placements_.push_back(placement);
+    placements_map_[placement->PlacementName()] = placement;
+    return;
+  }
+
+  const Sequence* sequence = node->As<Sequence>();
+  if (sequence != nullptr) {
+    sequences_.push_back(sequence);
+    sequences_map_[sequence->Name()] = sequence;
+    return;
+  }
+
+  const Model* model = node->As<Model>();
+  if (model != nullptr) {
+    models_.push_back(model);
+    models_map_[model->Name()] = model;
+    return;
+  }
+
+  const PropertyGraph* property_graph = node->As<PropertyGraph>();
+  if (property_graph != nullptr) {
+    property_graphs_.push_back(property_graph);
+    property_graphs_map_[property_graph->Name()] = property_graph;
+    return;
+  }
+
+  const NamedSchema* named_schema = node->As<NamedSchema>();
+  if (named_schema != nullptr) {
+    named_schemas_.push_back(named_schema);
+    named_schemas_map_[named_schema->Name()] = named_schema;
+    return;
+  }
+
+  const Udf* udf = node->As<Udf>();
+  if (udf != nullptr) {
+    udfs_.push_back(udf);
+    udfs_map_[udf->Name()] = udf;
+    return;
+  }
+
+  const LocalityGroup* locality_group = node->As<LocalityGroup>();
+  if (locality_group != nullptr) {
+    locality_groups_.push_back(locality_group);
+    locality_groups_map_[locality_group->Name()] = locality_group;
+    return;
+  }
+
+  const DatabaseOptions* database_options = node->As<DatabaseOptions>();
+  if (database_options != nullptr) {
+    database_options_ = database_options;
+    return;
+  }
+  // Columns need not be stored in the schema, they are just owned by the
+  // graph.
 }
 
 std::pair<absl::string_view, absl::string_view> SDLObjectName::SplitSchemaName(

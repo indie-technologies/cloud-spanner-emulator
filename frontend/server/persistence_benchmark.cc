@@ -128,6 +128,46 @@ void BM_SchemaRestore(benchmark::State& bench) {
   }
 }
 BENCHMARK(BM_SchemaRestore)->Arg(128)->Arg(512)->Arg(1024)->UseRealTime();
+// Model schemas with several indexes per table, where copying the accumulated
+// graph for each CREATE INDEX used to dominate restore even with no rows.
+void BM_IndexSchemaRestore(benchmark::State& bench) {
+  Fixture f;
+  if (!Check(bench, f.Init(0))) return;
+  auto ddl = [&](std::string statement) {
+    int count;
+    absl::Time timestamp;
+    absl::Status backfill;
+    std::vector<std::string> statements = {std::move(statement)};
+    return Check(bench, f.db->backend()->UpdateSchema(
+                            {.statements = statements}, &count, &timestamp,
+                            &backfill)) &&
+           Check(bench, backfill);
+  };
+  for (int t = 0; t < bench.range(0) / 4; ++t) {
+    if (!ddl(absl::StrCat(
+            "CREATE TABLE S", t,
+            " (id INT64, a INT64, b INT64, c INT64, d INT64, "
+            "e STRING(MAX), f STRING(MAX), g STRING(MAX), h STRING(MAX), "
+            "i TIMESTAMP, j TIMESTAMP, k BOOL, l BYTES(MAX)) PRIMARY KEY(id)")))
+      return;
+    for (int i = 0; i < 4; ++i) {
+      if (!ddl(absl::StrCat("CREATE INDEX S", t, "_I", i, " ON S", t, "(",
+                            std::string(1, 'a' + i), ") STORING(e)")))
+        return;
+    }
+  }
+  if (!Check(bench, f.state->Checkpoint().status())) return;
+  f.state.reset();
+  for (auto _ : bench) {
+    ServerEnv env;
+    if (!Check(bench, Persistence::Open(&env, f.dir + "/state").status()))
+      return;
+  }
+  bench.counters["indexes"] = bench.range(0);
+  bench.counters["tables"] = bench.range(0) / 4;
+}
+BENCHMARK(BM_IndexSchemaRestore)->Arg(128)->Arg(512)->Arg(1024)->UseRealTime();
+
 void BM_CleanCheckpoint(benchmark::State& bench) {
   Fixture f;
   if (!Check(bench, f.Init(10000)) ||

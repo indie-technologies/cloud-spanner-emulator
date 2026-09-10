@@ -67,10 +67,12 @@ a little-endian version, payload length and CRC32C. It uses GoogleSQL's value
 encoding, with explicit normalized representations for PostgreSQL numeric and
 JSONB values (including arrays), and distinguishes absent cells from typed NULL.
 It stores current schema definitions as parsed DDL protobufs, rather than a
-migration log. Current definitions are applied one at a time to avoid retaining
-all intermediate schema graphs. Restore uses the existing schema validator and
-index backfill implementation and loads base rows directly into storage without
-SQL INSERTs.
+migration log. Restore builds those definitions into one private schema graph,
+maintaining its catalog as objects are added. It checks new nodes as it goes,
+then canonicalizes and validates the complete graph once before publication.
+It reuses the existing schema validators and index backfill implementation and
+loads base rows directly into storage without SQL INSERTs. Ordinary migrations
+still use their existing schema generations and validation path.
 
 Runtime IDs are regenerated. Rows identify a table by its name (or a change
 stream by its name and internal-table role); columns map by name and type.
@@ -117,6 +119,10 @@ exports again and kills the child. To use native persistence:
 No Found files are changed by this implementation.
 
 ## Validation and benchmarks
+
+The measurements below describe the original persistence implementation. The
+schema construction optimization and its additional validation are described
+under "Single-pass schema restore" at the end.
 
 The implementation adds backend round-trip/concurrency tests and frontend
 file/lifecycle tests. Benchmark targets:
@@ -202,3 +208,28 @@ This schema-heavy case is still dominated by schema graph validation/rebuilding;
 the benefit of direct binary row loading grows with development data volume.
 Found's wrapper and RSpec setup were not changed or exercised as part of this
 persistence implementation.
+
+## Single-pass schema restore
+
+The restore path now constructs the current schema once instead of cloning and
+validating its growing graph after every definition. It accepts the dependency
+ordered current definitions emitted by the snapshot serializer, including
+foreign keys emitted after their tables. Destructive migrations and object
+replacements are rejected in snapshots. This changes neither format version 1
+nor transaction concurrency, and existing snapshot files need no conversion.
+
+On an optimized native Apple Silicon build, a real development snapshot with
+two databases, 356 tables, 1,136 secondary index definitions and 614 rows restored
+in **0.267 seconds**, compared with **12.77 seconds** before this change (about
+48 times faster). These are the backend restore log timings, excluding process
+and HTTP gateway startup. The 516 KiB file was restored, checkpointed and
+restored again; the checkpoint was byte-for-byte identical and every table,
+column, index definition and row fingerprint matched across restarts.
+
+Four additional backend tests cover many interacting indexes, post-restore
+migrations while an old reader retains its schema, dependent functions and
+views, malformed current definitions, and continued PostgreSQL OID assignment.
+The existing sequence, foreign-key, typed-value, corruption and concurrency
+tests also exercise this construction path. The persistence benchmark includes
+`BM_IndexSchemaRestore` at 128, 512 and 1,024 indexes to track schema-heavy
+restores separately from row loading.

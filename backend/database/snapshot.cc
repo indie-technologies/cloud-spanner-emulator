@@ -255,21 +255,31 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Restore(
   GOOGLESQL_ASSIGN_OR_RETURN(
       auto db,
       Create(clock, database_id, {.database_dialect = dialect}, false));
-  // Apply current definitions individually: full DDL batches retain every
-  // intermediate schema until validation finishes and can consume gigabytes
-  // for development schemas. This shares the fast migration path, without
-  // SQL parsing, row replay, or background writers racing the restored data.
-  for (const auto& statement : snapshot.schema()) {
-    int successful;
-    absl::Time timestamp;
-    absl::Status backfill;
-    GOOGLESQL_RETURN_IF_ERROR(db->UpdateSchema(
-        {.proto_descriptor_bytes = snapshot.proto_descriptors(),
-         .database_dialect = dialect,
-         .parsed_statements = absl::MakeConstSpan(&statement, 1)},
-        &successful, &timestamp, &backfill));
-    GOOGLESQL_RETURN_IF_ERROR(backfill);
-  }
+  // Restore is private until all schema, rows and counters have been checked.
+  // Build the current schema once without publishing intermediate generations.
+  SchemaUpdater updater;
+  std::vector<ddl::DDLStatement> definitions(snapshot.schema().begin(),
+                                             snapshot.schema().end());
+  auto context = db->GetSchemaChangeContext();
+  context.schema_change_timestamp = clock->Now();
+  GOOGLESQL_ASSIGN_OR_RETURN(
+      auto restored_schema,
+      updater.CreateSchemaFromSnapshot(
+          {.proto_descriptor_bytes = snapshot.proto_descriptors(),
+           .database_dialect = dialect,
+           .parsed_statements = definitions},
+          context));
+  auto previous_schema = db->GetLatestSchema();
+  GOOGLESQL_RETURN_IF_ERROR(db->versioned_catalog_->AddSchema(
+      context.schema_change_timestamp, std::move(restored_schema)));
+  ++db->schema_revision_;
+  db->action_manager_->AddActionsForSchema(
+      db->GetLatestSchema().get(), db->query_engine_->function_catalog(),
+      db->type_factory_.get());
+  db->query_engine_->SetLatestSchemaForFunctionCatalog(
+      db->GetLatestSchema().get());
+  db->storage_->SetVersionRetentionPeriod(
+      db->versioned_catalog_->version_retention_period());
   auto schema = db->GetLatestSchema();
   auto tables = SnapshotTables(*schema);
   if (tables.size() != snapshot.tables_size())
@@ -337,12 +347,12 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Restore(
     }
   }
   // Rebuild user and FK-managed indexes using the same code as CREATE INDEX.
-  SchemaValidationContext context(db->storage_.get(), nullptr,
-                                  db->type_factory_.get(), clock->Now(),
-                                  db->dialect_);
+  SchemaValidationContext index_context(db->storage_.get(), nullptr,
+                                        db->type_factory_.get(), clock->Now(),
+                                        db->dialect_);
   for (auto* table : schema->tables()) {
     for (auto* index : table->indexes())
-      GOOGLESQL_RETURN_IF_ERROR(BackfillIndex(index, &context));
+      GOOGLESQL_RETURN_IF_ERROR(BackfillIndex(index, &index_context));
   }
   std::set<SequenceID> seen_sequences;
   if (snapshot.sequences_size() != schema->sequences().size())
