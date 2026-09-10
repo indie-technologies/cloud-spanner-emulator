@@ -354,3 +354,5 @@ For information on reporting security vulnerabilities, see [SECURITY.md](./SECUR
 ## License
 
 [Apache License 2.0](LICENSE)
+
+Fork build and release instructions: [RELEASING.md](RELEASING.md).
