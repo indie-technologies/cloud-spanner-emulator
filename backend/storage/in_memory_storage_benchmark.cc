@@ -45,6 +45,54 @@ void BM_UpdateHotRow(benchmark::State& state) {
 }
 BENCHMARK(BM_UpdateHotRow)->Arg(1024)->Arg(8192);
 
+// Isolates write cost while snapshots remain open. Setup and destruction are
+// excluded. Later passes update the same rows without retaining more versions.
+void BM_UpdateRowsWithSnapshots(benchmark::State& state) {
+  const TableID table = "T";
+  const std::vector<ColumnID> columns = {"A", "B", "C", "D"};
+  const std::vector<googlesql::Value> initial(4, googlesql::values::Int64(0));
+  const std::vector<googlesql::Value> updated(4, googlesql::values::Int64(42));
+  std::vector<Key> keys;
+  for (int i = 0; i < 8192; ++i) {
+    keys.emplace_back(std::vector<googlesql::Value>{googlesql::values::Int64(i)});
+  }
+  for (auto _ : state) {
+    state.PauseTiming();
+    auto storage = std::make_unique<InMemoryStorage>();
+    for (const auto& key : keys) {
+      auto status = storage->Write(absl::UnixEpoch(), table, key, columns,
+                                   initial);
+      if (!status.ok()) {
+        state.SkipWithError(status.ToString());
+        return;
+      }
+    }
+    std::vector<std::unique_ptr<Storage>> snapshots;
+    for (int i = 0; i < state.range(0); ++i) {
+      snapshots.push_back(storage->CreateSnapshot());
+    }
+    state.ResumeTiming();
+    for (int pass = 0; pass < state.range(1); ++pass) {
+      for (const auto& key : keys) {
+        auto status = storage->Write(absl::UnixEpoch(), table, key, columns,
+                                     updated);
+        if (!status.ok()) {
+          state.SkipWithError(status.ToString());
+          return;
+        }
+      }
+    }
+    state.PauseTiming();
+    snapshots.clear();
+    storage.reset();
+    state.ResumeTiming();
+  }
+  state.SetItemsProcessed(state.iterations() * keys.size() * state.range(1));
+}
+BENCHMARK(BM_UpdateRowsWithSnapshots)
+    ->Args({0, 1})->Args({1, 1})->Args({4, 1})
+    ->Args({0, 8})->Args({1, 8})->Args({4, 8});
+
 // Measures scans after churn, excluding initial inserts/deletes. The old store
 // traverses tombstoned keys; the current-value store contains only live keys.
 void BM_ScanAfterDeletes(benchmark::State& state) {

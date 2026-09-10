@@ -25,11 +25,30 @@ two run medians. No compilation ran during measurement.
 | Streaming empty table scan, 128 extra tables | 240.0 µs | 244.1 µs | +1.7% |
 | Migration process peak RSS | 40.0 MiB | 39.8 MiB | Approximately unchanged |
 
-This comparison shows no material loss in the measured serial workloads. It
-does not measure write-heavy workloads with long-lived snapshots: those retain
-one before-image per changed row per active reader. Ordinary writes with no
-active readers retain the direct current-value storage path. Stale timestamp
-bounds remain unsupported.
+This comparison shows no material loss in the measured serial workloads.
+Snapshots retain one before-image per changed row per active reader. Ordinary
+writes with no active readers retain the direct current-value storage path.
+Stale timestamp bounds remain unsupported.
+
+A separate storage benchmark measures that retention cost: update 8,192 existing
+rows with four integer columns while zero, one, or four snapshots stay open.
+Setup and destruction are excluded. These are median wall times over five
+repetitions on the same machine, without local compilation during measurement.
+
+| Updates | No snapshots | One snapshot | Four snapshots |
+| --- | ---: | ---: | ---: |
+| One pass: 8,192 writes | 6.12 ms | 20.48 ms | 62.18 ms |
+| Eight passes: 65,536 writes | 48.63 ms | 101.15 ms | 254.78 ms |
+
+One retained snapshot adds about 1.8 µs per row on the first pass and 0.8 µs
+averaged across eight passes. Repeated updates retain no additional row versions,
+but still check each active snapshot. This isolates storage cost; it does not
+include SQL analysis, RPCs, or concurrent reader execution. Large write bursts
+with many long-lived readers have a measurable cost even though the serial
+workloads above do not regress. Reproduce with
+`//backend/storage:in_memory_storage_benchmark`, filter
+`BM_UpdateRowsWithSnapshots`, `--benchmark_min_time=0.25s`, and
+`--benchmark_repetitions=5`.
 
 The change passed 1,300 executed unit/integration test cases across storage, locking,
 transactions, SQL, schema updates, read conversion, and gRPC APIs on macOS.
